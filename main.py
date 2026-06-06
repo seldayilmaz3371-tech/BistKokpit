@@ -5,18 +5,25 @@ import plotly.graph_objects as go
 import datetime
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BIST PROFESYONEL KOKPİT  V11.0  — tek dosya                              ║
+# ║  BIST PROFESYONEL KOKPİT  V12.0  — tek dosya                              ║
 # ║  Sayfa yapısı: sidebar + col[2.5 / 5 / 2.5]  —  değiştirilemez           ║
-# ║  V11 değişiklikleri:                                                        ║
-# ║   • RS Slope filtresi  (rs.diff(5) > 0)                                    ║
-# ║   • Hacim doğrulaması  (RVOL > 1.5 AND pozitif kapanış)                   ║
-# ║   • RSI bandı          (50 < RSI < 70  yerine  rsi < 65)                  ║
-# ║   • Veri tazelik göstergesi  (🟢 / 🟡 / 🔴  sidebar + grafik üstü)       ║
-# ║   • Kompozit skor 5 → 6 sinyal                                             ║
+# ║  V12 değişiklikleri (V11 üzerine):                                          ║
+# ║   • Destek/Direnç V2:                                                       ║
+# ║       – Lookback 40 → 120 mum (~5 işlem günü)                             ║
+# ║       – ATR bazlı cluster birleştirme (ATR * 0.3)                          ║
+# ║       – Hacim doğrulaması (pivot hacmi > VolMA20)                          ║
+# ║       – %0.5 yakınlık filtresi (gürültü temizleme)                         ║
+# ║       – Seviye güç skoru (dokunma sayısı + hacim + yakınlık)               ║
+# ║   • 4H Trend Filtresi (yeni veri katmanı + yeni sinyal):                   ║
+# ║       – 4 saatlik close > 4H SMA20 → Bull / Bear                           ║
+# ║       – Broker tab'ında 7. sinyal olarak gösterilir                        ║
+# ║       – Kompozit skor 6 → 7 sinyale yükseldi                              ║
+# ║   • Grafik: 4H SMA izlerim artık ayrı renk şerit olarak gösterilir        ║
+# ║   • Planner: 4H rejim etiketli risk açıklaması                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 st.set_page_config(
-    page_title="BIST Kokpit V11.0",
+    page_title="BIST Kokpit V12.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -58,6 +65,15 @@ section.main > div { padding-top: 0.35rem !important; }
 .rb-bull { background:#14532d; color:#86efac; border:1px solid #22c55e; }
 .rb-bear { background:#450a0a; color:#fca5a5; border:1px solid #ef4444; }
 .rb-none { background:#1c1f2e; color:#94a3b8; border:1px solid #374151; }
+
+/* ── 4H Rejim banner ────────────────────────────────── */
+.h4-banner {
+    padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 600;
+    margin-bottom: 5px; text-align: center;
+}
+.h4-bull { background:#0a2318; color:#86efac; border:1px solid #16a34a; }
+.h4-bear { background:#2a0a0a; color:#fca5a5; border:1px solid #dc2626; }
+.h4-none { background:#1a1c2e; color:#94a3b8; border:1px solid #374151; }
 
 /* ── Veri tazelik banner ────────────────────────────── */
 .freshness-banner {
@@ -116,7 +132,7 @@ section.main > div { padding-top: 0.35rem !important; }
     border-bottom:1px solid #1e2535; padding-bottom:2px;
 }
 
-/* ── Destek/Direnç seviye satırı ────────────────────── */
+/* ── Destek/Direnç seviye satırı (V12 güç skoru badge) ─ */
 .level-row {
     display:flex; justify-content:space-between; align-items:center;
     padding: 4px 9px; margin-bottom:2px; border-radius:4px;
@@ -131,6 +147,10 @@ section.main > div { padding-top: 0.35rem !important; }
 .level-row.sup .lv-val { color:#4ade80; }
 .level-row.cur .lv-val { color:#38bdf8; }
 .level-row .lv-dist    { font-size:10px; color:#6b7594; }
+.level-row .lv-badge   { font-size:9px; padding:1px 5px; border-radius:3px; font-weight:700; }
+.lv-strong { background:#14532d; color:#86efac; }
+.lv-mid    { background:#1c2a0a; color:#bef264; }
+.lv-weak   { background:#1a1a2e; color:#6b7594; }
 
 /* ── Risk/Ödül göstergesi ───────────────────────────── */
 .rr-bar-wrap {
@@ -159,15 +179,20 @@ BIST_30 = [
     "PGSUS","PETKM","SAHOL","SASA","SISE","TCELL","THYAO","TKFEN","TOASO",
     "TUPRS","VAKBN","YKBNK"
 ]
-SQUEEZE_LOOKBACK = 250   # ~2 haftalık 15m pencere
-REGIME_SMA       = 50    # XU100 SMA periyodu
-RISK_FULL        = 0.02  # bull rejim risk oranı
-RISK_HALF        = 0.01  # bear rejim risk oranı
-ATR_MULT         = 1.5   # stop mesafesi çarpanı
-RVOL_THRESHOLD   = 1.5   # hacim doğrulama eşiği
-RS_SLOPE_BARS    = 5     # RS slope hesabı için bar sayısı
-FRESHNESS_WARN   = 20    # dk — sarı eşik
-FRESHNESS_RED    = 40    # dk — kırmızı eşik
+SQUEEZE_LOOKBACK  = 250   # ~2 haftalık 15m pencere
+REGIME_SMA        = 50    # XU100 SMA periyodu
+RISK_FULL         = 0.02  # bull rejim risk oranı
+RISK_HALF         = 0.01  # bear rejim risk oranı
+ATR_MULT          = 1.5   # stop mesafesi çarpanı
+RVOL_THRESHOLD    = 1.5   # hacim doğrulama eşiği
+RS_SLOPE_BARS     = 5     # RS slope hesabı için bar sayısı
+FRESHNESS_WARN    = 20    # dk — sarı eşik
+FRESHNESS_RED     = 40    # dk — kırmızı eşik
+# V12 yeni sabitler
+SR_LOOKBACK       = 120   # destek/direnç lookback (40 → 120)
+SR_ATR_CLUSTER    = 0.3   # ATR çarpanı — yakın pivoları birleştir
+SR_MIN_DIST_PCT   = 0.005 # %0.5 yakınlık filtresi
+H4_SMA_PERIOD     = 20    # 4H SMA periyodu
 
 if "watchlist"   not in st.session_state: st.session_state.watchlist   = BIST_30.copy()
 if "event_risks" not in st.session_state: st.session_state.event_risks = {}
@@ -202,20 +227,69 @@ def get_data(ticker):
         df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="15m", progress=False))
         if df is None: return None
         c = df["Close"]
-        df["SMA20"]  = c.rolling(20).mean()
+        df["SMA20"]   = c.rolling(20).mean()
         d = c.diff()
-        df["RSI"]    = 100 - (100 / (1 + d.where(d > 0, 0.0).rolling(14).mean()
-                                         / (-d.where(d < 0, 0.0)).rolling(14).mean()))
-        df["TR"]     = pd.concat([
+        df["RSI"]     = 100 - (100 / (1 + d.where(d > 0, 0.0).rolling(14).mean()
+                                          / (-d.where(d < 0, 0.0)).rolling(14).mean()))
+        df["TR"]      = pd.concat([
             df["High"] - df["Low"],
             (df["High"] - c.shift()).abs(),
             (df["Low"]  - c.shift()).abs()
         ], axis=1).max(axis=1)
-        df["ATR"]    = df["TR"].rolling(14).mean()
-        df["VolMA20"]= df["Volume"].rolling(20).mean()
+        df["ATR"]     = df["TR"].rolling(14).mean()
+        df["VolMA20"] = df["Volume"].rolling(20).mean()
         return df.dropna()
     except Exception:
         return None
+
+# ── YENİ: 4 SAATLİK VERİ ────────────────────────────────────────────────────
+@st.cache_data(ttl=600)
+def get_data_4h(ticker):
+    """
+    4 saatlik trend teyidi için veri çeker.
+    Close > SMA20(4H) → bull, altında → bear.
+    """
+    try:
+        df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="1h", progress=False))
+        if df is None or df.empty: return None
+        # 1h verisini her 4 barda resample → yaklaşık 4H
+        df_4h = df.resample("4h").agg({
+            "Open":   "first",
+            "High":   "max",
+            "Low":    "min",
+            "Close":  "last",
+            "Volume": "sum"
+        }).dropna()
+        df_4h["SMA20_4H"] = df_4h["Close"].rolling(H4_SMA_PERIOD).mean()
+        df_4h["ATR_4H"]   = pd.concat([
+            df_4h["High"] - df_4h["Low"],
+            (df_4h["High"] - df_4h["Close"].shift()).abs(),
+            (df_4h["Low"]  - df_4h["Close"].shift()).abs()
+        ], axis=1).max(axis=1).rolling(14).mean()
+        df_4h["VolMA20_4H"] = df_4h["Volume"].rolling(20).mean()
+        return df_4h.dropna()
+    except Exception:
+        return None
+
+def h4_trend(ticker):
+    """
+    Returns: dict(bull=bool|None, label=str, css=str, icon=str, sma=float|None)
+    """
+    df = get_data_4h(ticker)
+    if df is None or df.empty:
+        return {"bull": None, "label": "4H Veri Yok", "css": "h4-none", "icon": "📡", "sma": None}
+    try:
+        c   = float(df["Close"].iloc[-1])
+        sma = float(df["SMA20_4H"].iloc[-1])
+        if pd.isna(sma):
+            return {"bull": None, "label": "4H Yetersiz Veri", "css": "h4-none", "icon": "📡", "sma": None}
+        if c > sma:
+            return {"bull": True,  "label": f"4H BULL — {c:.2f} > SMA20 {sma:.2f}",
+                    "css": "h4-bull", "icon": "📗", "sma": sma}
+        return     {"bull": False, "label": f"4H BEAR — {c:.2f} < SMA20 {sma:.2f}",
+                    "css": "h4-bear", "icon": "📕", "sma": sma}
+    except Exception:
+        return {"bull": None, "label": "4H Hesaplama Hatası", "css": "h4-none", "icon": "⚠️", "sma": None}
 
 # ── İNDİKATÖR FONKSİYONLARI ─────────────────────────────────────────────────
 def bollinger_squeeze(close):
@@ -229,11 +303,6 @@ def bollinger_squeeze(close):
         return pd.Series(False, index=close.index)
 
 def relative_strength_full(stock_close, xu100_df):
-    """
-    RS serisi + RS_MA20 + RS Slope döndürür.
-    Slope: rs.diff(RS_SLOPE_BARS) > 0  →  RS hızlanıyor mu?
-    Sadece rs > rs_ma20 değil, hızlanma da ayrıca kontrol edilir.
-    """
     if xu100_df is None or xu100_df.empty:
         return None, None, None
     try:
@@ -242,16 +311,15 @@ def relative_strength_full(stock_close, xu100_df):
         sc = stock_close.copy();       sc.name = "stk"
         aln = pd.concat([sc, xu], axis=1).ffill().dropna()
         if aln.empty: return None, None, None
-        rs      = aln["stk"] / aln["idx"]
-        rs_ma   = rs.rolling(20).mean()
-        rs_above = rs > rs_ma                         # RS güçlü mü?
-        rs_slope = rs.diff(RS_SLOPE_BARS) > 0         # RS hızlanıyor mu?
+        rs       = aln["stk"] / aln["idx"]
+        rs_ma    = rs.rolling(20).mean()
+        rs_above = rs > rs_ma
+        rs_slope = rs.diff(RS_SLOPE_BARS) > 0
         return rs_above, rs_slope, rs
     except Exception:
         return None, None, None
 
 def event_risk(ticker):
-    """3 durum: ⚠ risk var | ✅ temiz | 📡 veri yok"""
     try:
         ed = yf.Ticker(f"{ticker}.IS").info.get("earningsDate")
         if ed is None: return "📡"
@@ -276,11 +344,6 @@ def market_regime(xu100_df):
         return na
 
 def data_freshness(df):
-    """
-    Son mumdan bu yana geçen süreyi hesaplar.
-    Piyasa kapalıysa (>900dk) ayrı durum döndürür.
-    Returns: dict(age_min, css, icon, label, is_closed)
-    """
     try:
         age = (datetime.datetime.now() - df.index[-1]).total_seconds() / 60
         if age > 900:
@@ -299,34 +362,109 @@ def data_freshness(df):
         return {"age": 0, "css": "fb-yellow", "icon": "⚠️",
                 "label": "Zaman bilinmiyor", "is_closed": False}
 
-def support_resistance(df, lookback=40):
+# ── DESTEK / DİRENÇ V2 ───────────────────────────────────────────────────────
+def support_resistance_v2(df, lookback=SR_LOOKBACK):
+    """
+    V12 — profesyonel seviye tespiti:
+    1. Lookback 40 → 120 (yaklaşık 5 işlem günü)
+    2. ATR bazlı cluster birleştirme (ATR * SR_ATR_CLUSTER)
+    3. Hacim doğrulaması — her pivotur için o bardaki hacim VolMA20'ye kıyasla
+    4. %0.5 yakınlık filtresi (gürültü temizleme)
+    5. Güç skoru: dokunma sayısı (cluster içi pivot) + hacim bonusu + yakınlık bonusu
+
+    Returns:
+        supports    : list[dict]  — {price, score, label}
+        resistances : list[dict]  — {price, score, label}
+    """
     try:
-        hi    = df["High"].iloc[-lookback:].values
-        lo    = df["Low"].iloc[-lookback:].values
+        lb    = min(lookback, len(df) - 5)
+        sub   = df.iloc[-lb:].copy()
+        hi    = sub["High"].values
+        lo    = sub["Low"].values
+        vol   = sub["Volume"].values
+        vol_ma = sub["VolMA20"].values
+        atr   = float(df["ATR"].iloc[-1])
         price = float(df["Close"].iloc[-1])
-        ph, pl = [], []
+
+        cluster_dist = atr * SR_ATR_CLUSTER
+
+        raw_ph, raw_pl = [], []  # (fiyat, hacim_oranı)
         for i in range(2, len(hi) - 2):
-            if hi[i] > hi[i-1] and hi[i] > hi[i-2] and hi[i] > hi[i+1] and hi[i] > hi[i+2]:
-                ph.append(hi[i])
-            if lo[i] < lo[i-1] and lo[i] < lo[i-2] and lo[i] < lo[i+1] and lo[i] < lo[i+2]:
-                pl.append(lo[i])
-        return (sorted([p for p in pl if p < price], reverse=True)[:2],
-                sorted([p for p in ph if p > price])[:2])
+            # Pivot High
+            if (hi[i] > hi[i-1] and hi[i] > hi[i-2]
+                    and hi[i] > hi[i+1] and hi[i] > hi[i+2]):
+                vr = vol[i] / vol_ma[i] if vol_ma[i] > 0 else 1.0
+                raw_ph.append((hi[i], vr))
+            # Pivot Low
+            if (lo[i] < lo[i-1] and lo[i] < lo[i-2]
+                    and lo[i] < lo[i+1] and lo[i] < lo[i+2]):
+                vr = vol[i] / vol_ma[i] if vol_ma[i] > 0 else 1.0
+                raw_pl.append((lo[i], vr))
+
+        def cluster_levels(pivots):
+            """ATR bazlı cluster birleştirme + güç skoru hesabı"""
+            if not pivots: return []
+            pivots_s = sorted(pivots, key=lambda x: x[0])
+            clusters = []
+            cur = [pivots_s[0]]
+            for pv in pivots_s[1:]:
+                if abs(pv[0] - cur[-1][0]) <= cluster_dist:
+                    cur.append(pv)
+                else:
+                    clusters.append(cur)
+                    cur = [pv]
+            clusters.append(cur)
+
+            result = []
+            for cl in clusters:
+                avg_price = sum(p for p, _ in cl) / len(cl)
+                avg_vol_r = sum(v for _, v in cl) / len(cl)
+                touches   = len(cl)
+
+                # %0.5 yakınlık filtresi — fiyata çok yakın seviyeleri ele
+                if abs(avg_price - price) / price < SR_MIN_DIST_PCT:
+                    continue
+
+                # Güç skoru (0-10)
+                touch_score  = min(touches * 2, 5)        # max 5
+                vol_score    = min(avg_vol_r - 1.0, 3)    # max 3, RVOL>1 ise bonus
+                vol_score    = max(vol_score, 0)
+                dist_pct     = abs(avg_price - price) / price
+                near_score   = 2 if dist_pct < 0.03 else (1 if dist_pct < 0.06 else 0)
+                score        = touch_score + vol_score + near_score
+
+                if   score >= 7: strength = "GÜÇLÜ"
+                elif score >= 4: strength = "ORTA"
+                else:            strength = "ZAYIF"
+
+                result.append({
+                    "price":    avg_price,
+                    "score":    score,
+                    "label":    strength,
+                    "touches":  touches,
+                    "vol_ratio": avg_vol_r,
+                })
+            return result
+
+        all_res = cluster_levels(raw_ph)
+        all_sup = cluster_levels(raw_pl)
+
+        # Fiyat altı → destek, üstü → direnç (tekrar kontrol)
+        supports    = sorted([l for l in all_sup if l["price"] < price],
+                             key=lambda x: -x["price"])[:3]
+        resistances = sorted([l for l in all_res if l["price"] > price],
+                             key=lambda x:  x["price"])[:3]
+
+        return supports, resistances
+
     except Exception:
         return [], []
 
 # ── BACKTEST ─────────────────────────────────────────────────────────────────
-def run_backtest(df, xu100_df):
+def run_backtest(df, xu100_df, h4_bull=None):
     """
-    V11 değişikliği:
-    Giriş sinyali kompozit skorla tutarlı:
-      • Trend (Close > SMA20)
-      • RSI bandı: 50 < RSI < 70  (V10: rsi < 65)
-      • RS güçlü (rs_above)
-      • RS hızlanıyor (rs_slope)  ← YENİ
-      • Squeeze aktif
-      • Hacim doğrulaması (RVOL > 1.5 AND pozitif kapanış)  ← YENİ
-    Çıkış: Trend kırıldı VEYA RS bozuldu VEYA Stop çalıştı
+    V12: 7. sinyal olarak 4H trend eklenmiştir.
+    h4_bull: True/False/None — None ise bu filtre devre dışı
     """
     try:
         sqz      = bollinger_squeeze(df["Close"])
@@ -349,8 +487,9 @@ def run_backtest(df, xu100_df):
         for _, r in bt.iterrows():
             if not pos:
                 rsi_ok  = 50 < r.RSI < 70
+                h4_ok   = True if h4_bull is None else h4_bull  # 4H ek filtre
                 entry   = (r.Close > r.SMA20 and rsi_ok and r.RS
-                           and r.RS_SLOPE and r.SQZ and r.VOL_OK)
+                           and r.RS_SLOPE and r.SQZ and r.VOL_OK and h4_ok)
                 if entry:
                     pos, buy_px = True, r.Close
                     stop_px = buy_px - r.ATR * ATR_MULT
@@ -404,6 +543,10 @@ def regime_html(reg, extra=""):
     return (f"<div class='regime-banner {reg['css']}' style='{extra}'>"
             f"{reg['icon']} {reg['lbl']}</div>")
 
+def h4_banner_html(h4, extra=""):
+    return (f"<div class='h4-banner {h4['css']}' style='{extra}'>"
+            f"{h4['icon']} {h4['label']}</div>")
+
 def freshness_html(fr, extra=""):
     return (f"<div class='freshness-banner {fr['css']}' style='{extra}'>"
             f"{fr['icon']} {fr['label']}</div>")
@@ -418,9 +561,9 @@ def sig_row_html(label, state, t_txt, f_txt, none_txt="📡 Veri Yok"):
             f"<span class='sv {vcls}'>{t_txt if state else f_txt}</span></div>")
 
 def karar_html(skor, n):
-    if   skor >= 5: css, lbl, ikon = "kc-al",  "GÜÇLÜ AL",    "💚"
-    elif skor >= 4: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
-    elif skor >= 3: css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
+    if   skor >= 6: css, lbl, ikon = "kc-al",  "GÜÇLÜ AL",    "💚"
+    elif skor >= 5: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
+    elif skor >= 4: css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
     else:           css, lbl, ikon = "kc-sat",  "BEKLE / SAT", "🔴"
     return (f"<div class='karar-card {css}'>"
             f"<div class='karar-lbl'>Kompozit Karar — {skor}/{n} sinyal aktif</div>"
@@ -435,24 +578,34 @@ def metric_grid(*cards):
 def sec_div(text):
     return f"<div class='sec-divider'>{text}</div>"
 
-def level_rows_html(price, supports, resistances):
+def strength_badge(label):
+    css = "lv-strong" if label == "GÜÇLÜ" else ("lv-mid" if label == "ORTA" else "lv-weak")
+    return f"<span class='lv-badge {css}'>{label}</span>"
+
+def level_rows_html_v2(price, supports, resistances):
+    """
+    V12: güç skoru badge'i, dokunma sayısı ve RVOL gösterir.
+    supports/resistances: list[dict] (price, score, label, touches, vol_ratio)
+    """
     html = ""
     for r in reversed(resistances):
-        dist = (r / price - 1) * 100
+        dist = (r["price"] / price - 1) * 100
         html += (f"<div class='level-row res'>"
-                 f"<span class='lv-lbl'>Direnç</span>"
-                 f"<span class='lv-val'>{r:.2f} TL</span>"
-                 f"<span class='lv-dist'>+{dist:.2f}%</span></div>")
+                 f"<span class='lv-lbl'>Direnç {strength_badge(r['label'])}</span>"
+                 f"<span class='lv-val'>{r['price']:.2f} TL</span>"
+                 f"<span class='lv-dist'>+{dist:.2f}% · {r['touches']}x · RVOL {r['vol_ratio']:.1f}</span>"
+                 f"</div>")
     html += (f"<div class='level-row cur'>"
              f"<span class='lv-lbl'>Güncel Fiyat</span>"
              f"<span class='lv-val'>{price:.2f} TL</span>"
              f"<span class='lv-dist'>—</span></div>")
     for s in supports:
-        dist = (price / s - 1) * 100
+        dist = (price / s["price"] - 1) * 100
         html += (f"<div class='level-row sup'>"
-                 f"<span class='lv-lbl'>Destek</span>"
-                 f"<span class='lv-val'>{s:.2f} TL</span>"
-                 f"<span class='lv-dist'>-{dist:.2f}%</span></div>")
+                 f"<span class='lv-lbl'>Destek {strength_badge(s['label'])}</span>"
+                 f"<span class='lv-val'>{s['price']:.2f} TL</span>"
+                 f"<span class='lv-dist'>-{dist:.2f}% · {s['touches']}x · RVOL {s['vol_ratio']:.1f}</span>"
+                 f"</div>")
     return html
 
 def rr_bar_html(risk_tl, reward_tl, ratio):
@@ -543,7 +696,6 @@ with col_l:
             d = get_data(t)
             if d is not None:
                 rs_ab, rs_sl, _ = relative_strength_full(d["Close"], xu100)
-                # Scanner'da RS: güçlü VE hızlanıyor ise 💚, sadece güçlü ise 🟡
                 if rs_ab is None:
                     rs_icon = "📡"
                 elif bool(rs_ab.iloc[-1]) and bool(rs_sl.iloc[-1]):
@@ -578,10 +730,15 @@ with col_l:
 with col_c:
     st.markdown(f"### 📈 {secilen} · 15m Grafik")
     if df is not None and not df.empty:
-        # Veri tazelik göstergesi — grafik üstü
         fr = data_freshness(df)
         st.markdown(freshness_html(fr, "font-size:10px;padding:3px 8px;margin-bottom:4px"),
                     unsafe_allow_html=True)
+
+        # 4H SMA seviyesi — grafik referansı
+        h4_info = h4_trend(secilen)
+
+        # Destek/Direnç V2 seviyeleri — grafik üzerinde çiz
+        supports_v2, resistances_v2 = support_resistance_v2(df)
 
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
@@ -593,6 +750,48 @@ with col_c:
             x=df.index, y=df["SMA20"], mode="lines",
             name="SMA20", line=dict(color="#38bdf8", width=1.5)
         ))
+
+        # 4H SMA yatay referans çizgisi
+        if h4_info["sma"] is not None:
+            fig.add_hline(
+                y=h4_info["sma"],
+                line_dash="dash",
+                line_color="#a78bfa",
+                line_width=1.2,
+                annotation_text=f"4H SMA20: {h4_info['sma']:.2f}",
+                annotation_position="bottom right",
+                annotation_font_size=9,
+                annotation_font_color="#a78bfa"
+            )
+
+        # Destek seviyeleri — yatay çizgi
+        for s in supports_v2:
+            dash = "solid" if s["label"] == "GÜÇLÜ" else "dot"
+            fig.add_hline(
+                y=s["price"],
+                line_dash=dash,
+                line_color="rgba(34,197,94,0.5)",
+                line_width=1,
+                annotation_text=f"D {s['price']:.2f} ({s['label']})",
+                annotation_position="bottom left",
+                annotation_font_size=8,
+                annotation_font_color="rgba(34,197,94,0.8)"
+            )
+
+        # Direnç seviyeleri — yatay çizgi
+        for r in resistances_v2:
+            dash = "solid" if r["label"] == "GÜÇLÜ" else "dot"
+            fig.add_hline(
+                y=r["price"],
+                line_dash=dash,
+                line_color="rgba(239,68,68,0.5)",
+                line_width=1,
+                annotation_text=f"R {r['price']:.2f} ({r['label']})",
+                annotation_position="top left",
+                annotation_font_size=8,
+                annotation_font_color="rgba(239,68,68,0.8)"
+            )
+
         fig.update_xaxes(rangebreaks=[
             dict(bounds=["18:00", "09:55"]),
             dict(bounds=["sat", "mon"])
@@ -621,25 +820,28 @@ with col_r:
         vol_now  = float(df["Volume"].iloc[-1])
         vol_ma   = float(df["VolMA20"].iloc[-1]) if "VolMA20" in df.columns else vol_now
 
-        # Türetilmiş — tüm tablar paylaşır
-        sqz_now            = bool(bollinger_squeeze(df["Close"]).iloc[-1])
+        # Türetilmiş değerler
+        sqz_now              = bool(bollinger_squeeze(df["Close"]).iloc[-1])
         rs_above, rs_slope_s, rs_raw = relative_strength_full(df["Close"], xu100)
-        rs_now             = bool(rs_above.iloc[-1])  if rs_above  is not None else None
-        rs_slope_now       = bool(rs_slope_s.iloc[-1]) if rs_slope_s is not None else None
-        supports, resistances = support_resistance(df)
-        fr                 = data_freshness(df)
+        rs_now               = bool(rs_above.iloc[-1])   if rs_above   is not None else None
+        rs_slope_now         = bool(rs_slope_s.iloc[-1]) if rs_slope_s is not None else None
+
+        # 4H trend filtresi — V12
+        h4_info  = h4_trend(secilen)
+        h4_bull  = h4_info["bull"]  # True / False / None
+
+        # Destek/Direnç V2
+        supports_v2, resistances_v2 = support_resistance_v2(df)
+
+        fr = data_freshness(df)
 
         lb        = min(26, len(df) - 1)
         deg_pct   = (fiyat / float(df["Close"].iloc[-lb]) - 1) * 100
         sma_pct   = (fiyat / sma - 1) * 100
         vol_pct   = atr / fiyat * 100
         vol_ratio = vol_now / vol_ma if vol_ma > 0 else 1.0
-
-        # Hacim doğrulaması (RVOL > 1.5 VE pozitif kapanış)
         vol_confirmed = (vol_ratio >= RVOL_THRESHOLD) and (fiyat > fiyat_p)
-
-        # RSI bandı: 50 < RSI < 70  (V11 düzeltmesi)
-        rsi_ok = 50 < rsi < 70
+        rsi_ok    = 50 < rsi < 70
 
         # RSI zonu etiketi
         if   rsi >= 70: rz_lbl, rz_cls = "AŞIRI ALIM",  "dn"
@@ -649,21 +851,22 @@ with col_r:
         elif rsi >= 30: rz_lbl, rz_cls = "ZAYIF BÖLGE", "dn"
         else:           rz_lbl, rz_cls = "AŞIRI SATIM", "wn"
 
-        # Kompozit skor — 6 filtre (V11)
+        # Kompozit skor — 7 filtre (V12)
         sinyaller = [
-            fiyat > sma,                       # 1. Trend
-            rsi_ok,                            # 2. RSI bandı (50-70)
-            rs_now is True,                    # 3. RS güçlü
-            rs_slope_now is True,              # 4. RS hızlanıyor (YENİ)
-            sqz_now,                           # 5. Squeeze
-            vol_confirmed,                     # 6. Hacim doğrulaması (YENİ)
+            fiyat > sma,          # 1. Trend (15m)
+            rsi_ok,               # 2. RSI bandı (50-70)
+            rs_now is True,       # 3. RS güçlü
+            rs_slope_now is True, # 4. RS hızlanıyor
+            sqz_now,              # 5. Squeeze
+            vol_confirmed,        # 6. Hacim doğrulaması
+            h4_bull is True,      # 7. 4H Trend Bull (YENİ)
         ]
         skor = sum(sinyaller)
 
         # Risk/Ödül
         stop      = fiyat - atr * ATR_MULT
         risk_tl   = max(fiyat - stop, 0.01)
-        hedef     = fiyat + risk_tl * 2        # 1:2 sabit oran
+        hedef     = fiyat + risk_tl * 2
         reward_tl = hedef - fiyat
         rr_ratio  = reward_tl / risk_tl
 
@@ -677,6 +880,9 @@ with col_r:
             lot        = int((portfoy * aktif_risk) / risk_tl)
             maliyet    = lot * fiyat
             st.markdown(regime_html(regime, "font-size:10px;padding:4px 8px"),
+                        unsafe_allow_html=True)
+            # 4H banner — planner'da da göster
+            st.markdown(h4_banner_html(h4_info, "font-size:10px;padding:3px 8px"),
                         unsafe_allow_html=True)
             st.markdown(metric_grid(
                 ("Giriş Fiyatı",   f"{fiyat:.2f} TL",       ""),
@@ -693,8 +899,6 @@ with col_r:
         # ║  TAB 2 — BROKER                ║
         # ╚══════════════════════════════════╝
         with tab2:
-
-            # Bayat veri uyarısı
             if fr["css"] in ("fb-yellow", "fb-red") and not fr["is_closed"]:
                 st.markdown(freshness_html(fr, "font-size:10px;padding:3px 8px"),
                             unsafe_allow_html=True)
@@ -702,7 +906,11 @@ with col_r:
             # 1. Kompozit karar
             st.markdown(karar_html(skor, len(sinyaller)), unsafe_allow_html=True)
 
-            # 2. Fiyat & Momentum
+            # 2. 4H Trend banner
+            st.markdown(h4_banner_html(h4_info, "font-size:10px;padding:3px 8px"),
+                        unsafe_allow_html=True)
+
+            # 3. Fiyat & Momentum
             st.markdown(sec_div("Fiyat & Momentum"), unsafe_allow_html=True)
             st.markdown(metric_grid(
                 ("Değişim (~6.5s)", f"{'+'if deg_pct>=0 else ''}{deg_pct:.2f}%",
@@ -715,53 +923,68 @@ with col_r:
                 ("ATR Değeri",      f"{atr:.2f} TL",   ""),
             ), unsafe_allow_html=True)
 
-            # 3. Hacim doğrulaması
+            # 4. Hacim doğrulaması
             st.markdown(sec_div("Hacim Doğrulaması (RVOL)"), unsafe_allow_html=True)
             st.markdown(vol_bar_html(vol_now, vol_ma, vol_ratio, vol_confirmed),
                         unsafe_allow_html=True)
 
-            # 4. Destek / Direnç
-            st.markdown(sec_div("Destek & Direnç (Son 40 Mum)"), unsafe_allow_html=True)
-            if supports or resistances:
-                st.markdown(level_rows_html(fiyat, supports, resistances),
+            # 5. Destek / Direnç V2
+            st.markdown(sec_div("Destek & Direnç V2 — ATR Cluster · Güç Skoru"), unsafe_allow_html=True)
+            if supports_v2 or resistances_v2:
+                st.markdown(level_rows_html_v2(fiyat, supports_v2, resistances_v2),
                             unsafe_allow_html=True)
+                st.markdown(
+                    "<div style='font-size:9px;color:#4a5568;margin-top:3px'>"
+                    "Dokunma (x) — RVOL — Güç: GÜÇLÜ≥7 · ORTA≥4 · ZAYIF&lt;4  "
+                    f"· Lookback: {SR_LOOKBACK} mum (~5 gün)"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
             else:
-                st.caption("Pivot bulunamadı.")
+                st.caption("Cluster bazlı pivot bulunamadı.")
 
-            # 5. Risk / Ödül
+            # 6. Risk / Ödül
             st.markdown(sec_div("Risk / Ödül"), unsafe_allow_html=True)
             st.markdown(rr_bar_html(risk_tl, reward_tl, rr_ratio), unsafe_allow_html=True)
 
-            # 6. Sinyal detayı — 6 filtre
-            st.markdown(sec_div("Sinyal Detayı (6 Filtre)"), unsafe_allow_html=True)
+            # 7. Sinyal detayı — 7 filtre
+            st.markdown(sec_div("Sinyal Detayı (7 Filtre — V12)"), unsafe_allow_html=True)
 
-            # RS satırları: güçlü + slope ayrı ayrı göster
             if rs_now is None:
-                rs_ab_html  = (f"<div class='sr unk'><span class='sl'>RS vs XU100</span>"
-                               f"<span class='sv wn'>📡 Veri Yok</span></div>")
-                rs_sl_html  = (f"<div class='sr unk'><span class='sl'>RS Slope (Hız)</span>"
-                               f"<span class='sv wn'>📡 Veri Yok</span></div>")
+                rs_ab_html = (f"<div class='sr unk'><span class='sl'>RS vs XU100</span>"
+                              f"<span class='sv wn'>📡 Veri Yok</span></div>")
+                rs_sl_html = (f"<div class='sr unk'><span class='sl'>RS Slope (Hız)</span>"
+                              f"<span class='sv wn'>📡 Veri Yok</span></div>")
             else:
-                rs_ab_html  = sig_row_html("RS vs XU100", rs_now,
-                                           "💚 XU100'den Güçlü", "🔴 XU100'den Zayıf")
-                rs_sl_html  = sig_row_html("RS Slope (Hız)", rs_slope_now,
-                                           "📈 RS Hızlanıyor — Lider Adayı",
-                                           "📉 RS Yavaşlıyor — Dikkat")
+                rs_ab_html = sig_row_html("RS vs XU100", rs_now,
+                                          "💚 XU100'den Güçlü", "🔴 XU100'den Zayıf")
+                rs_sl_html = sig_row_html("RS Slope (Hız)", rs_slope_now,
+                                          "📈 RS Hızlanıyor — Lider Adayı",
+                                          "📉 RS Yavaşlıyor — Dikkat")
+
+            # 4H sinyal satırı
+            h4_row = sig_row_html(
+                "4H Trend (SMA20)", h4_bull,
+                f"📗 Bull — {h4_info['label'].split('—')[1].strip() if '—' in h4_info['label'] else ''}",
+                f"📕 Bear — {h4_info['label'].split('—')[1].strip() if '—' in h4_info['label'] else ''}",
+                none_txt="📡 4H Veri Yok"
+            )
 
             st.markdown(
-                sig_row_html("Trend (SMA20)",   fiyat > sma,
+                sig_row_html("Trend (SMA20 15m)", fiyat > sma,
                              "✅ Pozitif — Fiyat SMA üstünde",
                              "❌ Negatif — Fiyat SMA altında") +
-                sig_row_html("RSI Bandı",        rsi_ok,
+                sig_row_html("RSI Bandı",          rsi_ok,
                              f"✅ Sağlıklı — {rsi:.1f} (50-70 bandında)",
                              f"⚠️ Bant Dışı — {rsi:.1f} ({'Aşırı Alım' if rsi>=70 else 'Düşük Momentum'})") +
                 rs_ab_html + rs_sl_html +
-                sig_row_html("Bollinger SQZ",    sqz_now,
+                sig_row_html("Bollinger SQZ",       sqz_now,
                              "🟡 Sıkışma — Enerji Birikti",
                              "⚪ Normal Volatilite") +
-                sig_row_html("Hacim Doğrulama",  vol_confirmed,
+                sig_row_html("Hacim Doğrulama",     vol_confirmed,
                              f"✅ RVOL x{vol_ratio:.1f} + Pozitif Kapanış",
-                             f"❌ Doğrulanmadı (RVOL x{vol_ratio:.1f})"),
+                             f"❌ Doğrulanmadı (RVOL x{vol_ratio:.1f})") +
+                h4_row,
                 unsafe_allow_html=True
             )
             st.caption("⏱️ 15dk gecikmeli veri — giriş öncesi teyit alın.")
@@ -770,8 +993,8 @@ with col_r:
         # ║  TAB 3 — BACKTEST              ║
         # ╚══════════════════════════════════╝
         with tab3:
-            st.caption("Giriş: Trend+RSI(50-70)+RS+RS Slope+SQZ+RVOL  ·  Çıkış: Trend/RS/Stop")
-            res = run_backtest(df, xu100)
+            st.caption("Giriş: Trend+RSI(50-70)+RS+RS Slope+SQZ+RVOL+4H Trend  ·  Çıkış: Trend/RS/Stop")
+            res = run_backtest(df, xu100, h4_bull=h4_bull)
             if res.get("err"):
                 st.info(f"ℹ️ {res['err']}")
             else:
@@ -819,17 +1042,41 @@ with col_r:
             elif rs_slope_now:         st.success("📈 Hızlanıyor — Lider Adayı.")
             else:                      st.warning("📉 Yavaşlıyor — Momentum Zayıflıyor.")
 
-            st.markdown("**4. Event Risk**")
+            st.markdown("**4. 4H Trend Filtresi (YENİ — V12)**")
+            st.markdown(h4_banner_html(h4_info), unsafe_allow_html=True)
+            if h4_bull is None:
+                st.info("📡 4H veri çekilemedi.")
+            elif h4_bull:
+                st.success(f"📗 4H Yükseliş Trendi — Fiyat 4H SMA20 üzerinde.")
+            else:
+                st.error(f"📕 4H Düşüş Trendi — Dikkatli olun, 15m sinyali zayıf kalır.")
+            st.caption("4H trend ters yönde ise 15m sinyaller güvenilirlik kaybeder.")
+
+            st.markdown("**5. Destek/Direnç V2 — En Güçlü Seviyeler**")
+            if supports_v2:
+                best_sup = max(supports_v2, key=lambda x: x["score"])
+                st.success(f"💚 En güçlü destek: {best_sup['price']:.2f} TL  "
+                           f"({best_sup['label']} · {best_sup['touches']}x dokunma)")
+            if resistances_v2:
+                best_res = max(resistances_v2, key=lambda x: x["score"])
+                st.error(f"🔴 En güçlü direnç: {best_res['price']:.2f} TL  "
+                         f"({best_res['label']} · {best_res['touches']}x dokunma)")
+            if not supports_v2 and not resistances_v2:
+                st.info("Cluster bazlı seviye bulunamadı.")
+            st.caption(f"ATR cluster mesafesi: {float(df['ATR'].iloc[-1])*SR_ATR_CLUSTER:.2f} TL  "
+                       f"· Lookback: {SR_LOOKBACK} mum")
+
+            st.markdown("**6. Event Risk**")
             if   evt == "⚠":  st.warning("⚠️ Risk — Yakın bilanço / olay var.")
             elif evt == "✅": st.success("✅ Temiz Takvim.")
             else:              st.info("📡 Sorgulanmamış — Event Risklerini Yükle.")
 
-            st.markdown("**5. Market Regime (XU100 / SMA50)**")
+            st.markdown("**7. Market Regime (XU100 / SMA50)**")
             if   regime["css"] == "rb-bull": st.success(f"🟢 {regime['lbl']}")
             elif regime["css"] == "rb-bear": st.error(f"🔴 {regime['lbl']}")
             else:                             st.warning(f"⚠️ {regime['lbl']}")
 
-            st.markdown("**6. Veri Tazeliği**")
+            st.markdown("**8. Veri Tazeliği**")
             st.markdown(freshness_html(fr), unsafe_allow_html=True)
     else:
         st.warning("Seçili hisse için veri alınamadı.")
