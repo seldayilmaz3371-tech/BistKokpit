@@ -3,31 +3,25 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import datetime
+import urllib.parse
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BIST PROFESYONEL KOKPİT  V13.0  — tek dosya                              ║
+# ║  BIST PROFESYONEL KOKPİT  V13.1  — tek dosya                              ║
 # ║  Sayfa yapısı: sidebar + col[2.5 / 5 / 2.5]  —  değiştirilemez           ║
-# ║  V13 değişiklikleri (V12 üzerine):                                          ║
-# ║   • Breakout Kalite Filtresi (8. sinyal):                                   ║
-# ║       – Close > High.rolling(20).max().shift(1)                             ║
-# ║       – Yalancı sıkışma kırılımlarını etkili biçimde eler                  ║
-# ║   • ATR Rejim Filtresi (9. sinyal):                                         ║
-# ║       – ATR% = ATR / Close * 100 > ATR_PCT_MIN (varsayılan %1.2)           ║
-# ║       – Ölü / hareketsiz hisseleri ve düşük volatilite dönemlerini eler    ║
-# ║   • 4H Trend Yükseltmesi: SMA20 → EMA20/EMA50 Çaprazı                     ║
-# ║       – EMA20_4H > EMA50_4H → Bull  (daha güvenilir trend teyidi)          ║
-# ║       – Eski SMA20 mantığı tamamen kaldırıldı                               ║
-# ║   • Destek/Direnç V3:                                                       ║
-# ║       – Lookback 120 → 200 mum (~8 işlem günü)                             ║
-# ║       – Hacim ağırlıklı fiyat kümelenmesi (VWAP proxy)                     ║
-# ║       – Minimum pivot kalite skoru eşiği: küçük dönüş noktaları atlanır    ║
-# ║       – Güç skoru üst sınırı 10 → 12 (daha hassas ayrıştırma)             ║
-# ║   • Kompozit skor 7 → 9 sinyale yükseldi                                  ║
-# ║   • Backtest: 9 filtreli giriş koşulu                                       ║
+# ║  V13.1 değişiklikleri (V13 üzerine):                                        ║
+# ║   • Watchlist kalıcılığı: st.query_params ile URL encode                   ║
+# ║       – Sayfa yenilemede liste kaybolmuyor                                  ║
+# ║       – Tarayıcı yer imine alınabilir liste                                 ║
+# ║   • Seçili hisse kalıcılığı: query_params["sel"] ile korunuyor             ║
+# ║   • Kompozit skor düzeltmesi:                                               ║
+# ║       – None sinyaller False yerine SKIP olarak işleniyor                   ║
+# ║       – Skor "aktif/toplam" yerine "aktif/değerlendirilen" gösteriliyor    ║
+# ║   • yFinance period: "60d" → "59d" (API sınırı güvenli marj)              ║
+# ║   • Portföy değeri session_state'de korunuyor                              ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 st.set_page_config(
-    page_title="BIST Kokpit V13.0",
+    page_title="BIST Kokpit V13.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -200,28 +194,70 @@ BIST_30 = [
     "PGSUS","PETKM","SAHOL","SASA","SISE","TCELL","THYAO","TKFEN","TOASO",
     "TUPRS","VAKBN","YKBNK"
 ]
-SQUEEZE_LOOKBACK  = 250   # ~2 haftalık 15m pencere
-REGIME_SMA        = 50    # XU100 SMA periyodu
-RISK_FULL         = 0.02  # bull rejim risk oranı
-RISK_HALF         = 0.01  # bear rejim risk oranı
-ATR_MULT          = 1.5   # stop mesafesi çarpanı
-RVOL_THRESHOLD    = 1.5   # hacim doğrulama eşiği
-RS_SLOPE_BARS     = 5     # RS slope hesabı için bar sayısı
-FRESHNESS_WARN    = 20    # dk — sarı eşik
-FRESHNESS_RED     = 40    # dk — kırmızı eşik
-# V12 sabitler
-SR_LOOKBACK       = 200   # destek/direnç lookback (120 → 200, ~8 işlem günü)
-SR_ATR_CLUSTER    = 0.3   # ATR çarpanı — yakın pivoları birleştir
-SR_MIN_DIST_PCT   = 0.005 # %0.5 yakınlık filtresi
-# V13 yeni sabitler
-H4_EMA_FAST       = 20    # 4H EMA hızlı periyot (eski: SMA20)
-H4_EMA_SLOW       = 50    # 4H EMA yavaş periyot (YENİ: çapraz filtresi)
-BREAKOUT_BARS     = 20    # Breakout kalite filtresi: son N mumun zirvesi
-ATR_PCT_MIN       = 1.2   # ATR% minimum eşiği — ölü hisseleri eler
+SQUEEZE_LOOKBACK  = 250
+REGIME_SMA        = 50
+RISK_FULL         = 0.02
+RISK_HALF         = 0.01
+ATR_MULT          = 1.5
+RVOL_THRESHOLD    = 1.5
+RS_SLOPE_BARS     = 5
+FRESHNESS_WARN    = 20
+FRESHNESS_RED     = 40
+SR_LOOKBACK       = 200
+SR_ATR_CLUSTER    = 0.3
+SR_MIN_DIST_PCT   = 0.005
+H4_EMA_FAST       = 20
+H4_EMA_SLOW       = 50
+BREAKOUT_BARS     = 20
+ATR_PCT_MIN       = 1.2
+# V13.1: query_params anahtar adları
+QP_WATCHLIST      = "wl"   # hisse listesi — virgülle ayrılmış
+QP_SELECTED       = "sel"  # seçili hisse
 
-if "watchlist"   not in st.session_state: st.session_state.watchlist   = BIST_30.copy()
-if "event_risks" not in st.session_state: st.session_state.event_risks = {}
-if "scan_rows"   not in st.session_state: st.session_state.scan_rows   = []
+# ── V13.1: WATCHLIST KALICILIĞI — query_params ───────────────────────────────
+def _qp_load_watchlist():
+    """URL'deki ?wl=AKBNK,GARAN,... parametresinden listeyi oku."""
+    try:
+        raw = st.query_params.get(QP_WATCHLIST, "")
+        if raw:
+            tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+            return tickers if tickers else BIST_30.copy()
+    except Exception:
+        pass
+    return BIST_30.copy()
+
+def _qp_save_watchlist(wl):
+    """Watchlist'i URL query_params'a yaz."""
+    try:
+        st.query_params[QP_WATCHLIST] = ",".join(sorted(wl))
+    except Exception:
+        pass
+
+def _qp_load_selected(watchlist):
+    """URL'deki ?sel=AKBNK parametresinden seçili hisseyi oku."""
+    try:
+        sel = st.query_params.get(QP_SELECTED, "")
+        if sel and sel in watchlist:
+            return sel
+    except Exception:
+        pass
+    return sorted(watchlist)[0]
+
+def _qp_save_selected(ticker):
+    """Seçili hisseyi URL query_params'a yaz."""
+    try:
+        st.query_params[QP_SELECTED] = ticker
+    except Exception:
+        pass
+
+# ── SESSION STATE BAŞLATMA ───────────────────────────────────────────────────
+# V13.1: İlk yüklemede query_params'tan oku; sonraki rerun'larda session_state kullan
+if "wl_initialized" not in st.session_state:
+    st.session_state.watchlist   = _qp_load_watchlist()
+    st.session_state.event_risks = {}
+    st.session_state.scan_rows   = []
+    st.session_state.portfoy     = 100_000
+    st.session_state.wl_initialized = True
 
 # ── VERİ KATMANI ─────────────────────────────────────────────────────────────
 def _flatten(df):
@@ -238,7 +274,7 @@ def _flatten(df):
 def get_xu100():
     for sym in ("XU100.IS", "^XU100"):
         try:
-            df = _flatten(yf.download(sym, period="60d", interval="15m", progress=False))
+            df = _flatten(yf.download(sym, period="59d", interval="15m", progress=False))
             if df is not None:
                 df["SMA50"] = df["Close"].rolling(REGIME_SMA).mean()
                 return df
@@ -249,7 +285,8 @@ def get_xu100():
 @st.cache_data(ttl=300)
 def get_data(ticker):
     try:
-        df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="15m", progress=False))
+        # V13.1: period="59d" — 60d API sınırı için güvenli marj
+        df = _flatten(yf.download(f"{ticker}.IS", period="59d", interval="15m", progress=False))
         if df is None: return None
         c = df["Close"]
         df["SMA20"]   = c.rolling(20).mean()
@@ -263,21 +300,15 @@ def get_data(ticker):
         ], axis=1).max(axis=1)
         df["ATR"]     = df["TR"].rolling(14).mean()
         df["VolMA20"] = df["Volume"].rolling(20).mean()
-        # V13: Breakout kalite için rolling max
         df["HH20"]    = df["High"].rolling(BREAKOUT_BARS).max()
         return df.dropna()
     except Exception:
         return None
 
-# ── 4 SAATLİK VERİ — V13 EMA ÇAPRAZ ─────────────────────────────────────────
 @st.cache_data(ttl=600)
 def get_data_4h(ticker):
-    """
-    V13: SMA20 → EMA20/EMA50 çaprazı.
-    EMA20_4H > EMA50_4H → Bull (daha güvenilir trend teyidi)
-    """
     try:
-        df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="1h", progress=False))
+        df = _flatten(yf.download(f"{ticker}.IS", period="59d", interval="1h", progress=False))
         if df is None or df.empty: return None
         df_4h = df.resample("4h").agg({
             "Open":   "first",
@@ -286,7 +317,6 @@ def get_data_4h(ticker):
             "Close":  "last",
             "Volume": "sum"
         }).dropna()
-        # V13: EMA20 ve EMA50 (SMA yerine)
         df_4h["EMA20_4H"] = df_4h["Close"].ewm(span=H4_EMA_FAST, adjust=False).mean()
         df_4h["EMA50_4H"] = df_4h["Close"].ewm(span=H4_EMA_SLOW, adjust=False).mean()
         df_4h["ATR_4H"]   = pd.concat([
@@ -300,10 +330,6 @@ def get_data_4h(ticker):
         return None
 
 def h4_trend(ticker):
-    """
-    V13: EMA20 > EMA50 çaprazı → Bull / Bear
-    Returns: dict(bull, label, css, icon, ema_fast, ema_slow)
-    """
     df = get_data_4h(ticker)
     if df is None or df.empty:
         return {"bull": None, "label": "4H Veri Yok", "css": "h4-none", "icon": "📡",
@@ -327,13 +353,7 @@ def h4_trend(ticker):
         return {"bull": None, "label": "4H Hesaplama Hatası", "css": "h4-none", "icon": "⚠️",
                 "ema_fast": None, "ema_slow": None}
 
-# ── V13: ATR REJİM FİLTRESİ ──────────────────────────────────────────────────
 def atr_regime(df):
-    """
-    ATR% = ATR / Close * 100 > ATR_PCT_MIN → aktif volatilite
-    Ölü / hareketsiz hisseleri eler.
-    Returns: dict(active, atr_pct, label, css, icon)
-    """
     try:
         atr   = float(df["ATR"].iloc[-1])
         price = float(df["Close"].iloc[-1])
@@ -351,13 +371,7 @@ def atr_regime(df):
         return {"active": None, "atr_pct": 0,
                 "label": "ATR Hesaplanamadı", "css": "atr-none", "icon": "⚠️"}
 
-# ── V13: BREAKOUT KALİTE FİLTRESİ ────────────────────────────────────────────
 def breakout_quality(df):
-    """
-    Close > HH20.shift(1) → gerçek breakout
-    Yalancı sıkışma kırılımlarını eler.
-    Returns: dict(ok, close, hh20, label)
-    """
     try:
         close = float(df["Close"].iloc[-1])
         hh20  = float(df["HH20"].shift(1).iloc[-1])
@@ -443,19 +457,6 @@ def data_freshness(df):
 
 # ── DESTEK / DİRENÇ V3 ───────────────────────────────────────────────────────
 def support_resistance_v3(df, lookback=SR_LOOKBACK):
-    """
-    V13 — kurumsal seviye tespiti:
-    1. Lookback 120 → 200 mum (~8 işlem günü)
-    2. ATR bazlı cluster birleştirme (ATR * SR_ATR_CLUSTER)
-    3. Hacim ağırlıklı ortalama fiyat (VWAP proxy) — daha hassas seviye merkezi
-    4. Minimum pivot kalite skoru eşiği — küçük dönüşler atlanır
-    5. %0.5 yakınlık filtresi
-    6. Güç skoru max 12 (V12: 10) — daha hassas ayrıştırma
-
-    Returns:
-        supports    : list[dict]  — {price, score, label, touches, vol_ratio}
-        resistances : list[dict]  — {price, score, label, touches, vol_ratio}
-    """
     try:
         lb    = min(lookback, len(df) - 5)
         sub   = df.iloc[-lb:].copy()
@@ -469,23 +470,17 @@ def support_resistance_v3(df, lookback=SR_LOOKBACK):
 
         cluster_dist = atr * SR_ATR_CLUSTER
 
-        raw_ph, raw_pl = [], []  # (fiyat, hacim, hacim_oranı)
+        raw_ph, raw_pl = [], []
         for i in range(3, len(hi) - 3):
             vr = vol[i] / vol_ma[i] if vol_ma[i] > 0 else 1.0
-            # Pivot High — 3 bar sol/sağ (V12: 2 bar) → daha temiz pivotlar
             if (hi[i] > hi[i-1] and hi[i] > hi[i-2] and hi[i] > hi[i-3]
                     and hi[i] > hi[i+1] and hi[i] > hi[i+2] and hi[i] > hi[i+3]):
                 raw_ph.append((hi[i], vol[i], vr))
-            # Pivot Low
             if (lo[i] < lo[i-1] and lo[i] < lo[i-2] and lo[i] < lo[i-3]
                     and lo[i] < lo[i+1] and lo[i] < lo[i+2] and lo[i] < lo[i+3]):
                 raw_pl.append((lo[i], vol[i], vr))
 
         def cluster_levels(pivots):
-            """
-            ATR bazlı cluster birleştirme.
-            V13: Hacim ağırlıklı fiyat ortalaması (VWAP proxy) kullanılır.
-            """
             if not pivots: return []
             pivots_s = sorted(pivots, key=lambda x: x[0])
             clusters = []
@@ -500,7 +495,6 @@ def support_resistance_v3(df, lookback=SR_LOOKBACK):
 
             result = []
             for cl in clusters:
-                # V13: Hacim ağırlıklı ortalama fiyat
                 total_vol  = sum(v for _, v, _ in cl)
                 if total_vol > 0:
                     vwap_price = sum(p * v for p, v, _ in cl) / total_vol
@@ -509,24 +503,21 @@ def support_resistance_v3(df, lookback=SR_LOOKBACK):
                 avg_vol_r  = sum(vr for _, _, vr in cl) / len(cl)
                 touches    = len(cl)
 
-                # %0.5 yakınlık filtresi
                 if abs(vwap_price - price) / price < SR_MIN_DIST_PCT:
                     continue
 
-                # Güç skoru (0-12, V12: 0-10)
-                touch_score = min(touches * 2, 6)          # max 6 (V12: 5)
-                vol_score   = min(avg_vol_r - 1.0, 4)      # max 4 (V12: 3)
+                touch_score = min(touches * 2, 6)
+                vol_score   = min(avg_vol_r - 1.0, 4)
                 vol_score   = max(vol_score, 0)
                 dist_pct    = abs(vwap_price - price) / price
                 near_score  = 2 if dist_pct < 0.03 else (1 if dist_pct < 0.06 else 0)
                 score       = touch_score + vol_score + near_score
 
-                # V13: Minimum kalite eşiği — tek dokunuşlu zayıf pivotlar atlanır
                 if touches < 2 and avg_vol_r < 1.2:
                     continue
 
-                if   score >= 8: strength = "GÜÇLÜ"   # V12: 7
-                elif score >= 5: strength = "ORTA"     # V12: 4
+                if   score >= 8: strength = "GÜÇLÜ"
+                elif score >= 5: strength = "ORTA"
                 else:            strength = "ZAYIF"
 
                 result.append({
@@ -553,10 +544,6 @@ def support_resistance_v3(df, lookback=SR_LOOKBACK):
 
 # ── BACKTEST ─────────────────────────────────────────────────────────────────
 def run_backtest(df, xu100_df, h4_bull=None, atr_active=None, breakout_ok=None):
-    """
-    V13: 9 sinyalli giriş koşulu.
-    h4_bull, atr_active, breakout_ok: None ise ilgili filtre devre dışı
-    """
     try:
         sqz      = bollinger_squeeze(df["Close"])
         rs_above, rs_slope, _ = relative_strength_full(df["Close"], xu100_df)
@@ -566,11 +553,9 @@ def run_backtest(df, xu100_df, h4_bull=None, atr_active=None, breakout_ok=None):
         vol_ratio_s = df["Volume"] / df["VolMA20"]
         vol_confirm = (vol_ratio_s > RVOL_THRESHOLD) & (df["Close"] > df["Close"].shift(1))
 
-        # Breakout serisi
         hh20_shift = df["HH20"].shift(1)
         bkout_series = df["Close"] > hh20_shift
 
-        # ATR% serisi
         atr_pct_series = df["ATR"] / df["Close"] * 100
         atr_ok_series  = atr_pct_series > ATR_PCT_MIN
 
@@ -673,14 +658,22 @@ def sig_row_html(label, state, t_txt, f_txt, none_txt="📡 Veri Yok"):
     return (f"<div class='sr {cls}'><span class='sl'>{label}</span>"
             f"<span class='sv {vcls}'>{t_txt if state else f_txt}</span></div>")
 
-def karar_html(skor, n):
-    # V13: 9 sinyal — eşikler güncellendi
-    if   skor >= 8: css, lbl, ikon = "kc-al",  "GÜÇLÜ AL",    "💚"
-    elif skor >= 6: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
-    elif skor >= 5: css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
-    else:           css, lbl, ikon = "kc-sat",  "BEKLE / SAT", "🔴"
+def karar_html(skor, n_degerl, n_toplam):
+    """
+    V13.1: skor = aktif sinyal sayısı
+           n_degerl = değerlendirilebilen sinyal sayısı (None olmayanlar)
+           n_toplam = toplam sinyal sayısı
+    """
+    # V13.1: Eşikler değerlendirilen sinyal sayısına göre oransal
+    oran = skor / n_degerl if n_degerl > 0 else 0
+    if   oran >= 0.88: css, lbl, ikon = "kc-al",  "GÜÇLÜ AL",    "💚"
+    elif oran >= 0.66: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
+    elif oran >= 0.55: css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
+    else:              css, lbl, ikon = "kc-sat",  "BEKLE / SAT", "🔴"
+    eksik = n_toplam - n_degerl
+    eksik_str = f" · {eksik} sinyal veri yok" if eksik > 0 else ""
     return (f"<div class='karar-card {css}'>"
-            f"<div class='karar-lbl'>Kompozit Karar — {skor}/{n} sinyal aktif</div>"
+            f"<div class='karar-lbl'>Kompozit Karar — {skor}/{n_degerl} sinyal aktif{eksik_str}</div>"
             f"<div class='karar-val'>{ikon} {lbl}</div></div>")
 
 def metric_grid(*cards):
@@ -776,15 +769,35 @@ def atr_reg_bar_html(atr_pct, active):
 xu100  = get_xu100()
 regime = market_regime(xu100)
 
+# V13.1: Sayfa yüklendikten sonra URL'den seçili hisseyi belirle
+_sel_default = _qp_load_selected(st.session_state.watchlist)
+
 with st.sidebar:
     st.header("⚙️ Kontrol Paneli")
     st.markdown(regime_html(regime), unsafe_allow_html=True)
 
-    secilen = st.selectbox("Hisse Seçin:", sorted(st.session_state.watchlist))
+    # V13.1: Seçili hisseyi query_params'tan al, selectbox'a index ver
+    _sorted_wl = sorted(st.session_state.watchlist)
+    _sel_idx   = _sorted_wl.index(_sel_default) if _sel_default in _sorted_wl else 0
+
+    secilen = st.selectbox(
+        "Hisse Seçin:",
+        _sorted_wl,
+        index=_sel_idx,
+        key="secilen_selectbox"
+    )
+    # V13.1: Seçimi URL'ye kaydet
+    _qp_save_selected(secilen)
+
+    # V13.1: Portföy session_state'de korunuyor
     portfoy = st.number_input(
         f"Portföy (TL)  ·  Aktif risk: %{regime['risk']*100:.0f}",
-        min_value=1000, value=100_000, step=10_000
+        min_value=1000,
+        value=st.session_state.portfoy,
+        step=10_000,
+        key="portfoy_input"
     )
+    st.session_state.portfoy = portfoy
 
     df_sb = get_data(secilen)
     if df_sb is not None:
@@ -795,14 +808,31 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📝 Liste Yönetimi")
+
+    # V13.1: URL'den mevcut listeyi göster (bilgilendirme)
+    st.caption(f"📌 Liste URL'ye kaydediliyor · {len(st.session_state.watchlist)} hisse")
+
     yeni = st.text_input("Hisse Ekle (Örn: ASELS):").upper().strip()
     b1, b2 = st.columns(2)
     with b1:
-        if st.button("➕ Ekle") and yeni and yeni not in st.session_state.watchlist:
-            st.session_state.watchlist.append(yeni); st.rerun()
+        if st.button("➕ Ekle"):
+            if yeni and yeni not in st.session_state.watchlist:
+                st.session_state.watchlist.append(yeni)
+                _qp_save_watchlist(st.session_state.watchlist)  # V13.1: URL'e yaz
+                st.rerun()
     with b2:
-        if st.button("🗑️ Çıkar") and len(st.session_state.watchlist) > 1:
-            st.session_state.watchlist.remove(secilen); st.rerun()
+        if st.button("🗑️ Çıkar"):
+            if len(st.session_state.watchlist) > 1 and secilen in st.session_state.watchlist:
+                st.session_state.watchlist.remove(secilen)
+                _qp_save_watchlist(st.session_state.watchlist)  # V13.1: URL'e yaz
+                st.rerun()
+
+    # V13.1: Listeyi BIST_30 varsayılanına sıfırla
+    st.divider()
+    if st.button("🔄 BIST30'a Sıfırla"):
+        st.session_state.watchlist = BIST_30.copy()
+        _qp_save_watchlist(st.session_state.watchlist)
+        st.rerun()
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
 col_l, col_c, col_r = st.columns([2.5, 5, 2.5])
@@ -829,8 +859,7 @@ with col_l:
                     rs_icon = "🟡"
                 else:
                     rs_icon = "🔴"
-                # V13: Breakout ve ATR ikonları
-                bkt = breakout_quality(d)
+                bkt   = breakout_quality(d)
                 atr_r = atr_regime(d)
                 rows.append({
                     "H":   t,
@@ -879,7 +908,6 @@ with col_c:
             name="SMA20", line=dict(color="#38bdf8", width=1.5)
         ))
 
-        # 4H EMA referans çizgileri (V13: iki ayrı EMA)
         if h4_info["ema_fast"] is not None:
             fig.add_hline(
                 y=h4_info["ema_fast"],
@@ -903,7 +931,6 @@ with col_c:
                 annotation_font_color="#7c3aed"
             )
 
-        # V13: Breakout seviyesi — son 20 mumun zirvesi
         if bkt_info["hh20"] > 0:
             dash_style = "solid" if bkt_info["ok"] else "dashdot"
             color_bkt  = "rgba(251,191,36,0.6)" if not bkt_info["ok"] else "rgba(251,191,36,0.3)"
@@ -918,7 +945,6 @@ with col_c:
                 annotation_font_color="rgba(251,191,36,0.9)"
             )
 
-        # Destek seviyeleri
         for s in supports_v3:
             dash = "solid" if s["label"] == "GÜÇLÜ" else "dot"
             fig.add_hline(
@@ -932,7 +958,6 @@ with col_c:
                 annotation_font_color="rgba(34,197,94,0.8)"
             )
 
-        # Direnç seviyeleri
         for r in resistances_v3:
             dash = "solid" if r["label"] == "GÜÇLÜ" else "dot"
             fig.add_hline(
@@ -978,7 +1003,6 @@ with col_r:
         rs_now               = bool(rs_above.iloc[-1])   if rs_above   is not None else None
         rs_slope_now         = bool(rs_slope_s.iloc[-1]) if rs_slope_s is not None else None
 
-        # V13: yeni filtreler
         h4_info   = h4_trend(secilen)
         h4_bull   = h4_info["bull"]
         atr_reg   = atr_regime(df)
@@ -1002,19 +1026,23 @@ with col_r:
         elif rsi >= 30: rz_lbl, rz_cls = "ZAYIF BÖLGE", "dn"
         else:           rz_lbl, rz_cls = "AŞIRI SATIM", "wn"
 
-        # Kompozit skor — 9 sinyal (V13)
-        sinyaller = [
-            fiyat > sma,              # 1. Trend (15m SMA20)
-            rsi_ok,                   # 2. RSI bandı (50-70)
-            rs_now is True,           # 3. RS güçlü
-            rs_slope_now is True,     # 4. RS hızlanıyor
+        # ── V13.1: Kompozit skor — None sinyaller SKIP ───────────────────────
+        # Her sinyal: (değer, None_geçerli_mi)
+        # None ise "veri yok" → skor hesabına dahil edilmez
+        sinyal_raw = [
+            fiyat > sma,              # 1. Trend
+            rsi_ok,                   # 2. RSI
+            rs_now,                   # 3. RS  (None olabilir)
+            rs_slope_now,             # 4. RS Slope (None olabilir)
             sqz_now,                  # 5. Squeeze
-            vol_confirmed,            # 6. Hacim doğrulaması
-            h4_bull is True,          # 7. 4H EMA20 > EMA50 (YENİ çapraz)
-            atr_reg["active"] is True,# 8. ATR% > %1.2 (YENİ)
-            bkt_info["ok"] is True,   # 9. Breakout kalite (YENİ)
+            vol_confirmed,            # 6. Hacim
+            h4_bull,                  # 7. 4H EMA (None olabilir)
+            atr_reg["active"],        # 8. ATR% (None olabilir)
+            bkt_info["ok"],           # 9. Breakout (None olabilir)
         ]
-        skor = sum(sinyaller)
+        N_TOPLAM   = len(sinyal_raw)
+        N_DEGERL   = sum(1 for s in sinyal_raw if s is not None)
+        skor       = sum(1 for s in sinyal_raw if s is True)
 
         stop      = fiyat - atr * ATR_MULT
         risk_tl   = max(fiyat - stop, 0.01)
@@ -1056,7 +1084,8 @@ with col_r:
                 st.markdown(freshness_html(fr, "font-size:10px;padding:3px 8px"),
                             unsafe_allow_html=True)
 
-            st.markdown(karar_html(skor, len(sinyaller)), unsafe_allow_html=True)
+            # V13.1: Güncellenmiş karar kartı (oransal + None-safe)
+            st.markdown(karar_html(skor, N_DEGERL, N_TOPLAM), unsafe_allow_html=True)
             st.markdown(h4_banner_html(h4_info, "font-size:10px;padding:3px 8px"),
                         unsafe_allow_html=True)
 
@@ -1076,12 +1105,10 @@ with col_r:
             st.markdown(vol_bar_html(vol_now, vol_ma, vol_ratio, vol_confirmed),
                         unsafe_allow_html=True)
 
-            # V13: ATR Rejim Çubuğu
             st.markdown(sec_div("ATR Rejim Filtresi (V13)"), unsafe_allow_html=True)
             st.markdown(atr_reg_bar_html(atr_reg["atr_pct"], atr_reg["active"]),
                         unsafe_allow_html=True)
 
-            # V13: Breakout Kalite
             st.markdown(sec_div(f"Breakout Kalite — Son {BREAKOUT_BARS} Mum Zirvesi (V13)"),
                         unsafe_allow_html=True)
             bkt_css = "ok" if bkt_info["ok"] else ("nok" if bkt_info["ok"] is False else "unk")
@@ -1112,7 +1139,6 @@ with col_r:
             st.markdown(sec_div("Risk / Ödül"), unsafe_allow_html=True)
             st.markdown(rr_bar_html(risk_tl, reward_tl, rr_ratio), unsafe_allow_html=True)
 
-            # Sinyal detayı — 9 filtre
             st.markdown(sec_div("Sinyal Detayı (9 Filtre — V13)"), unsafe_allow_html=True)
 
             if rs_now is None:
