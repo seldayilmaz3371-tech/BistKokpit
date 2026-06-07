@@ -6,20 +6,18 @@ import plotly.graph_objects as go
 import datetime
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BIST PROFESYONEL KOKPİT  V15.0  — tek dosya                              ║
+# ║  BIST PROFESYONEL KOKPİT  V16.0  — tek dosya                              ║
 # ║  Sayfa yapısı: sidebar + col[2.5 / 5 / 2.5]  —  değiştirilemez           ║
 # ║                                                                            ║
-# ║  V15 yenilikleri (V14 → V15):                                             ║
-# ║   1. RSI Percentile    (son 252 barda RSI yüzdeliği — adaptif bant)       ║
-# ║   2. ADX Slope         (eğim > 0 = trend güçleniyor, yanlış brk azalır)  ║
-# ║   3. Sektör RS         (hisse / sektör endeksi — gerçek lider testi)      ║
-# ║   4. ATR Percentile    (sabit bant yerine dinamik volatilite yüzdeliği)   ║
-# ║   5. VCP Skoru         (Minervini: daralan fiyat+hacim, artan RS)         ║
-# ║   6. Kompozit skor 14 → 19 filtre                                         ║
+# ║  V16 yenilikleri (V15 → V16):                                             ║
+# ║   1. DI Spread Filtresi   (+DI - -DI > 10 → gerçek trend ayrışması)      ║
+# ║   2. OBV Breakout         (OBV yeni 20-bar zirvesi → kurumsal giriş)     ║
+# ║   3. VWAP Filtresi        (Close > VWAP → kurumsal maliyet üstü)         ║
+# ║   4. Kompozit skor 19 → 22 filtre                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 st.set_page_config(
-    page_title="BIST Kokpit V15.0",
+    page_title="BIST Kokpit V16.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -152,10 +150,12 @@ section.main > div { padding-top: 0.35rem !important; }
 .level-row.res { background:#2a0a0a; border-left:3px solid #ef4444; }
 .level-row.sup { background:#052e16; border-left:3px solid #22c55e; }
 .level-row.cur { background:#0f1f35; border-left:3px solid #38bdf8; }
+.level-row.vwap { background:#0f1a35; border-left:3px solid #a78bfa; }
 .level-row .lv-lbl { color:#94a3b8; font-size:9.5px; }
 .level-row.res .lv-val { color:#f87171; font-weight:700; }
 .level-row.sup .lv-val { color:#4ade80; font-weight:700; }
 .level-row.cur .lv-val { color:#38bdf8; font-weight:700; }
+.level-row.vwap .lv-val { color:#a78bfa; font-weight:700; }
 .level-row .lv-dist { font-size:9.5px; color:#6b7594; }
 
 .rr-bar-wrap, .vol-bar-wrap { background:#0d1421; border-radius:6px; padding:8px 10px; margin-bottom:5px; }
@@ -172,6 +172,13 @@ section.main > div { padding-top: 0.35rem !important; }
 .mhs-row { display:flex; justify-content:space-between; align-items:center; margin-bottom:3px; font-size:10px; }
 .mhs-row .mhs-item { color:#94a3b8; }
 .mhs-row .mhs-check { font-weight:700; }
+
+/* V16: VWAP badge */
+.vwap-badge {
+    display:inline-block; background:#1a1040; border:1px solid #7c3aed;
+    color:#a78bfa; font-size:9px; font-weight:700; border-radius:3px;
+    padding:1px 5px; letter-spacing:0.3px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,7 +187,7 @@ SQUEEZE_LOOKBACK  = 250
 REGIME_SMA        = 50
 RISK_FULL         = 0.02
 RISK_HALF         = 0.01
-RISK_OFF          = 0.005   # V14: Market Health Score ≤ 1
+RISK_OFF          = 0.005
 ATR_MULT          = 1.5
 RVOL_THRESHOLD    = 1.5
 RS_SLOPE_BARS     = 5
@@ -195,39 +202,32 @@ ADX_PERIOD        = 14
 ADX_THRESHOLD     = 25
 VOL_PCT_LOOKBACK  = 250
 ATR_EXP_BARS      = 5
-BREADTH_NEUTRAL   = 55      # V14: Breadth eşiği piyasa rejimi için
-GAP_MAX_PCT       = 0.04    # V14: %4 üzeri gap → sinyal engeli
-RSI_PCT_LOOKBACK  = 252     # V15: RSI Percentile penceresi
-ADX_SLOPE_BARS    = 3       # V15: ADX eğim penceresi (bar)
-ATR_PCT_LOOKBACK  = 250     # V15: ATR Percentile penceresi
-VCP_LOOKBACK      = 60      # V15: VCP volatilite daralma penceresi
+BREADTH_NEUTRAL   = 55
+GAP_MAX_PCT       = 0.04
+RSI_PCT_LOOKBACK  = 252
+ADX_SLOPE_BARS    = 3
+ATR_PCT_LOOKBACK  = 250
+VCP_LOOKBACK      = 60
+# ── V16 yeni sabitler ────────────────────────────────────────────────────────
+DI_SPREAD_MIN     = 10      # V16: +DI - -DI farkı eşiği
+OBV_BRK_LOOKBACK  = 20      # V16: OBV zirve kırılımı penceresi
 
 # ── V15: Sektör haritası ─────────────────────────────────────────────────────
-# Hisse → BIST sektör endeksi eşleşmesi (eksik hisseler XU100 fallback kullanır)
 SEKTOR_MAP = {
-    # Bankacılık
     "AKBNK":"XBANK.IS","GARAN":"XBANK.IS","ISCTR":"XBANK.IS",
     "VAKBN":"XBANK.IS","YKBNK":"XBANK.IS","ALBRK":"XBANK.IS",
     "HALKB":"XBANK.IS","TSKB":"XBANK.IS","QNBFB":"XBANK.IS",
-    # Holding
     "KCHOL":"XHOLD.IS","SAHOL":"XHOLD.IS","ENKAI":"XHOLD.IS",
     "ALARK":"XHOLD.IS","TKFEN":"XHOLD.IS",
-    # Sanayi
     "EREGL":"XUSIN.IS","KRDMD":"XUSIN.IS","BRSAN":"XUSIN.IS",
     "OYAKC":"XUSIN.IS","ARCLK":"XUSIN.IS","TOASO":"XUSIN.IS",
     "FROTO":"XUSIN.IS","SISE":"XUSIN.IS","GUBRF":"XUSIN.IS",
     "PETKM":"XUSIN.IS","TUPRS":"XUSIN.IS","HEKTS":"XUSIN.IS",
-    # Teknoloji
     "ASELS":"XUTEK.IS","SASA":"XUTEK.IS","LOGO":"XUTEK.IS",
-    # Elektrik/Enerji
     "KONTR":"XELKT.IS","ASTOR":"XELKT.IS","AKSEN":"XELKT.IS",
-    # Perakende
     "BIMAS":"XMESY.IS","MGROS":"XMESY.IS",
-    # Havacılık/Ulaşım
     "THYAO":"XTRZM.IS","PGSUS":"XTRZM.IS",
-    # REIT
     "EKGYO":"XGMYO.IS",
-    # Telecom
     "TCELL":"XUHIZ.IS",
 }
 
@@ -250,7 +250,6 @@ def get_xu100():
             if df is not None:
                 df["SMA50"] = df["Close"].rolling(REGIME_SMA).mean()
                 df["RSI"]   = _calc_rsi(df["Close"])
-                # _calc_adx üç değer döndürür — tuple'ı ayrı ayrı ata
                 _adx, _pdi, _mdi = _calc_adx(df)
                 df["ADX"]        = _adx
                 df["PlusDI"]     = _pdi
@@ -262,12 +261,6 @@ def get_xu100():
 
 @st.cache_data(ttl=1800)
 def get_4h(ticker):
-    """
-    HTF Trend — 3 katmanlı fallback:
-      1) 4h interval (nadiren calışır BIST'te)
-      2) 1h resample -> 4h
-      3) Günlük 1d (2 yıl) — SMA50/200 için en güvenilir kaynak
-    """
     sym = f"{ticker}.IS"
 
     def _add_sma(df):
@@ -276,7 +269,6 @@ def get_4h(ticker):
         df["SMA200"] = df["Close"].rolling(200).mean()
         return df
 
-    # Yöntem 1: Doğrudan 4h
     try:
         df = _flatten(yf.download(sym, period="60d", interval="4h", progress=False))
         if df is not None and len(df) >= 55:
@@ -286,7 +278,6 @@ def get_4h(ticker):
     except Exception:
         pass
 
-    # Yöntem 2: 1h resample -> 4h
     try:
         df1h = _flatten(yf.download(sym, period="60d", interval="1h", progress=False))
         if df1h is not None and len(df1h) >= 55:
@@ -300,7 +291,6 @@ def get_4h(ticker):
     except Exception:
         pass
 
-    # Yöntem 3: Günlük veri — 2 yıl, SMA200 için en az 210 bar
     try:
         df = _flatten(yf.download(sym, period="2y", interval="1d", progress=False))
         if df is not None and len(df) >= 210:
@@ -312,14 +302,13 @@ def get_4h(ticker):
 
     return None
 
-# ── V14: Yardımcı hesaplama fonksiyonları ─────────────────────────────────────
+# ── İNDİKATÖR FONKSİYONLARI ─────────────────────────────────────────────────
 def _calc_rsi(close, period=14):
     d = close.diff()
     return 100 - (100 / (1 + d.where(d > 0, 0.0).rolling(period).mean()
                               / (-d.where(d < 0, 0.0)).rolling(period).mean()))
 
 def _calc_adx(df, period=ADX_PERIOD):
-    """ADX + +DI + -DI hesapla. Üç sütun döndürür."""
     h, l, c = df["High"], df["Low"], df["Close"]
     up_move  = h.diff()
     dn_move  = -l.diff()
@@ -332,6 +321,25 @@ def _calc_adx(df, period=ADX_PERIOD):
     dx       = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
     adx      = dx.ewm(alpha=1/period, adjust=False).mean()
     return adx, plus_di, minus_di
+
+# ── V16: VWAP Hesaplama ──────────────────────────────────────────────────────
+def _calc_vwap(df):
+    """
+    Seans bazlı VWAP: (H+L+C)/3 * Volume / kümülatif Volume.
+    Her günün başında sıfırlanır (anchored to daily open).
+    15m veride günlük VWAP hesaplar.
+    """
+    try:
+        typical = (df["High"] + df["Low"] + df["Close"]) / 3
+        pv      = typical * df["Volume"]
+        # Gün bazında kümülatif VWAP
+        date_idx = df.index.normalize()
+        cum_pv   = pv.groupby(date_idx).cumsum()
+        cum_vol  = df["Volume"].groupby(date_idx).cumsum()
+        vwap     = cum_pv / cum_vol.replace(0, np.nan)
+        return vwap
+    except Exception:
+        return pd.Series(np.nan, index=df.index)
 
 @st.cache_data(ttl=300)
 def get_data(ticker):
@@ -350,50 +358,51 @@ def get_data(ticker):
         df["VolMA20"] = df["Volume"].rolling(20).mean()
         df["High20"]  = h.rolling(BREAKOUT_BARS).max().shift(1)
 
-        # ADX + DI yönleri (V14)
         adx, plus_di, minus_di = _calc_adx(df)
         df["ADX"]      = adx
         df["PlusDI"]   = plus_di
         df["MinusDI"]  = minus_di
 
-        # Volume Percentile
         df["VolPct"] = (df["Volume"]
                         .rolling(VOL_PCT_LOOKBACK, min_periods=20)
                         .apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
                                raw=False))
 
-        # ATR Expansion
         df["ATR_Slope"] = df["ATR"].diff(ATR_EXP_BARS)
 
-        # ── V14: OBV ────────────────────────────────────────────────────────
         direction       = np.sign(c.diff())
         df["OBV"]       = (direction * df["Volume"]).fillna(0).cumsum()
         df["OBV_MA20"]  = df["OBV"].rolling(20).mean()
 
-        # ── V14: Gap filtresi ────────────────────────────────────────────────
         prev_close       = c.shift(1)
         df["GapPct"]     = ((df["Open"] - prev_close).abs() / prev_close.replace(0, np.nan))
 
-        # ── V15: RSI Percentile ──────────────────────────────────────────────
         df["RSI_Pct"] = (df["RSI"]
                          .rolling(RSI_PCT_LOOKBACK, min_periods=30)
                          .apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
                                 raw=False))
 
-        # ── V15: ADX Slope ───────────────────────────────────────────────────
         df["ADX_Slope"] = df["ADX"].diff(ADX_SLOPE_BARS)
 
-        # ── V15: ATR Percentile ──────────────────────────────────────────────
         df["ATR_Pct"] = (df["ATR"]
                          .rolling(ATR_PCT_LOOKBACK, min_periods=30)
                          .apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
                                 raw=False))
 
+        # ── V16: DI Spread ────────────────────────────────────────────────────
+        df["DI_Spread"] = df["PlusDI"] - df["MinusDI"]
+
+        # ── V16: OBV Breakout (OBV son 20 barın maksimumunu kırdı mı?) ───────
+        df["OBV_High20"] = df["OBV"].rolling(OBV_BRK_LOOKBACK).max().shift(1)
+
+        # ── V16: VWAP ─────────────────────────────────────────────────────────
+        df["VWAP"] = _calc_vwap(df)
+
         return df.dropna()
     except Exception:
         return None
 
-# ── İNDİKATÖR FONKSİYONLARI ─────────────────────────────────────────────────
+# ── FONKSİYONLAR (V15'ten taşındı, V16 eklemeleriyle) ──────────────────────
 def bollinger_squeeze(close):
     try:
         if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
@@ -406,7 +415,6 @@ def bollinger_squeeze(close):
 
 @st.cache_data(ttl=900)
 def get_sektor_data(sektor_sym):
-    """Sektör endeksi verisini çek — V15."""
     try:
         df = _flatten(yf.download(sektor_sym, period="60d", interval="15m", progress=False))
         return df
@@ -414,10 +422,6 @@ def get_sektor_data(sektor_sym):
         return None
 
 def sektor_rs(stock_close, ticker, xu100_df):
-    """
-    V15: Çift RS — Hisse/XU100 ve Hisse/SektörEndeksi.
-    Returns: (rs_xu100_ok, rs_sektor_ok, sektor_sym)
-    """
     sektor_sym = SEKTOR_MAP.get(ticker.upper())
     rs_sektor_ok = None
     if sektor_sym:
@@ -433,7 +437,6 @@ def sektor_rs(stock_close, ticker, xu100_df):
         except Exception:
             rs_sektor_ok = None
 
-    # XU100 RS (mevcut mantık)
     rs_xu100_ok = None
     if xu100_df is not None and not xu100_df.empty:
         try:
@@ -449,13 +452,6 @@ def sektor_rs(stock_close, ticker, xu100_df):
     return rs_xu100_ok, rs_sektor_ok, sektor_sym
 
 def vcp_score(df):
-    """
-    V15: VCP (Volatility Contraction Pattern) skoru — 0 ile 3 arası.
-    Kriterler:
-      1. Fiyat volatilitesi daralıyor (son 20 mum std < son 60 mum std)
-      2. Hacim daralıyor (son 20 mum ortalama < son 60 mum ortalama * 0.75)
-      3. RS yükseliyor (close > close.shift(20) ile proxy)
-    """
     try:
         c   = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
         vol = df["Volume"]
@@ -523,23 +519,11 @@ def event_risk(ticker):
     except Exception:
         return "📡"
 
-# ── V14: MARKET HEALTH SCORE (0-5) ───────────────────────────────────────────
+# ── MARKET HEALTH SCORE ───────────────────────────────────────────────────────
 def market_health_score(xu100_df, breadth_pct: float | None = None):
-    """
-    Kriter                    Puan
-    ─────────────────────────────
-    XU100 > SMA50             1
-    Breadth > 55%             1
-    Breadth > 70%             1 (ek)
-    XU100 RSI > 50            1
-    XU100 ADX > 20            1
-    ─────────────────────────────
-    Toplam                    5
-    """
     score  = 0
     detail = {}
 
-    # Kriter 1: XU100 > SMA50
     k1 = False
     if xu100_df is not None and "SMA50" in xu100_df.columns:
         try:
@@ -548,19 +532,16 @@ def market_health_score(xu100_df, breadth_pct: float | None = None):
             pass
     score += int(k1); detail["XU100 > SMA50"] = k1
 
-    # Kriter 2: Breadth > 55
     k2 = False
     if breadth_pct is not None:
         k2 = breadth_pct > BREADTH_NEUTRAL
     score += int(k2); detail[f"Breadth > {BREADTH_NEUTRAL}%"] = k2
 
-    # Kriter 3: Breadth > 70 (bonus)
     k3 = False
     if breadth_pct is not None:
         k3 = breadth_pct > 70
     score += int(k3); detail["Breadth > 70%"] = k3
 
-    # Kriter 4: XU100 RSI > 50
     k4 = False
     if xu100_df is not None and "RSI" in xu100_df.columns:
         try:
@@ -570,7 +551,6 @@ def market_health_score(xu100_df, breadth_pct: float | None = None):
             pass
     score += int(k4); detail["XU100 RSI > 50"] = k4
 
-    # Kriter 5: XU100 ADX > 20
     k5 = False
     if xu100_df is not None and "ADX" in xu100_df.columns:
         try:
@@ -586,14 +566,12 @@ def market_health_score(xu100_df, breadth_pct: float | None = None):
     return score, detail
 
 def mhs_risk(score: int) -> float:
-    """MHS skoruna göre dinamik risk oranı."""
-    if score >= 4: return RISK_FULL          # %2
-    if score == 3: return RISK_FULL          # %2
-    if score == 2: return RISK_HALF          # %1
-    return RISK_OFF                          # %0.5
+    if score >= 4: return RISK_FULL
+    if score == 3: return RISK_FULL
+    if score == 2: return RISK_HALF
+    return RISK_OFF
 
 def market_regime(xu100_df, breadth_pct: float | None = None):
-    """V14: Hem SMA50 hem Breadth + MHS'yi kullanır."""
     na = {"lbl":"Belirsiz","css":"rb-none","risk":RISK_FULL,"icon":"⚠️","mhs":0}
     if xu100_df is None or "SMA50" not in xu100_df.columns: return na
     try:
@@ -603,7 +581,6 @@ def market_regime(xu100_df, breadth_pct: float | None = None):
         mhs, _ = market_health_score(xu100_df, breadth_pct)
         risk    = mhs_risk(mhs)
         above_sma = c > s
-        # Breadth kontrolü ekle
         breadth_ok = (breadth_pct is None) or (breadth_pct > BREADTH_NEUTRAL)
         if above_sma and breadth_ok:
             return {"lbl":f"BULL — XU100 {c:.0f} > SMA50 {s:.0f}  |  MHS {mhs}/5",
@@ -651,13 +628,8 @@ def support_resistance_v2(df, lookback=SR_LOOKBACK):
     except Exception:
         return [], []
 
-# ── BACKTEST ─────────────────────────────────────────────────────────────────
+# ── BACKTEST (V16: 20 filtre) ─────────────────────────────────────────────────
 def run_backtest(df, xu100_df):
-    """
-    V14 Backtest: 14 filtre (OBV + ADX yön + Gap dahil)
-    Çıkış: Trend / RS / Stop
-    Maliyet: %0.30 her işlemde
-    """
     try:
         sqz                  = bollinger_squeeze(df["Close"])
         rs_above, rs_sl, _   = relative_strength_full(df["Close"], xu100_df)
@@ -669,15 +641,18 @@ def run_backtest(df, xu100_df):
         atr_pct_s    = df["ATR"] / df["Close"]
         atr_ok_s     = (atr_pct_s > ATR_PCT_MIN) & (atr_pct_s < ATR_PCT_MAX)
         adx_ok_s     = df["ADX"] > ADX_THRESHOLD
-        adx_dir_s    = df["PlusDI"] > df["MinusDI"]          # V14: ADX yön
+        adx_dir_s    = df["PlusDI"] > df["MinusDI"]
         vol_pct_ok_s = df["VolPct"] > 70
         atr_exp_s    = df["ATR_Slope"] > 0
-        obv_ok_s     = df["OBV"] > df["OBV_MA20"]            # V14: OBV
-        gap_ok_s     = df["GapPct"] < GAP_MAX_PCT             # V14: Gap filtresi
-        # V15: yeni filtreler backtest'e eklendi
-        rsi_pct_s    = df["RSI_Pct"] > 60                    if "RSI_Pct"   in df.columns else pd.Series(True, index=df.index)
-        adx_slope_s  = df["ADX_Slope"] > 0                   if "ADX_Slope" in df.columns else pd.Series(True, index=df.index)
+        obv_ok_s     = df["OBV"] > df["OBV_MA20"]
+        gap_ok_s     = df["GapPct"] < GAP_MAX_PCT
+        rsi_pct_s    = df["RSI_Pct"] > 60           if "RSI_Pct"   in df.columns else pd.Series(True, index=df.index)
+        adx_slope_s  = df["ADX_Slope"] > 0          if "ADX_Slope" in df.columns else pd.Series(True, index=df.index)
         atr_pct_s2   = (df["ATR_Pct"] > 10) & (df["ATR_Pct"] < 75) if "ATR_Pct" in df.columns else pd.Series(True, index=df.index)
+        # V16 yeni filtreler
+        di_spread_s  = df["DI_Spread"] > DI_SPREAD_MIN if "DI_Spread"  in df.columns else pd.Series(True, index=df.index)
+        obv_brk_s    = df["OBV"] > df["OBV_High20"]    if "OBV_High20" in df.columns else pd.Series(True, index=df.index)
+        vwap_s       = df["Close"] > df["VWAP"]         if "VWAP"       in df.columns else pd.Series(True, index=df.index)
 
         bt = pd.concat([
             df[["Close","SMA20","ATR","RSI","PlusDI","MinusDI"]],
@@ -696,6 +671,9 @@ def run_backtest(df, xu100_df):
             rsi_pct_s.rename("RSIPCT"),
             adx_slope_s.rename("ADXSLP"),
             atr_pct_s2.rename("ATRPCT"),
+            di_spread_s.rename("DISP"),
+            obv_brk_s.rename("OBVBRK"),
+            vwap_s.rename("VWAPOK"),
         ], axis=1).ffill().dropna()
 
         pos, buy_cost, stop_px, trades = False, 0.0, 0.0, []
@@ -705,7 +683,8 @@ def run_backtest(df, xu100_df):
                         and r.RS and r.RS_SL and r.SQZ and r.VOL
                         and r.BRK and r.ATROK and r.ADXOK and r.ADXDIR
                         and r.VPCT and r.ATREXP and r.OBV_OK and r.GAP_OK
-                        and r.RSIPCT and r.ADXSLP and r.ATRPCT):
+                        and r.RSIPCT and r.ADXSLP and r.ATRPCT
+                        and r.DISP and r.OBVBRK and r.VWAPOK):
                     pos      = True
                     buy_cost = r.Close * (1 + TRADE_COST)
                     stop_px  = r.Close - r.ATR * ATR_MULT
@@ -796,7 +775,6 @@ def htf_html(val, ticker):
             f"<div class='htf-banner htf-bear'>🔴 4H BEAR — SMA50 < SMA200</div>")
 
 def mhs_html(score: int, detail: dict):
-    """V14: Market Health Score banner + detay."""
     css_map = {5:"mhs-5",4:"mhs-4",3:"mhs-3",2:"mhs-2",1:"mhs-1",0:"mhs-0"}
     lbl_map = {5:"RİSK ON — Tam Pozisyon",
                4:"RİSK ON — Tam Pozisyon",
@@ -830,10 +808,10 @@ def sig_row_html(label, state, t_txt, f_txt, none_txt="📡 Veri Yok"):
             f"{t_txt if state else f_txt}</span></div>")
 
 def karar_html(skor, n):
-    # V15: 19 filtre → eşikler orantılı güncellendi (%79/%63/%37)
-    if   skor >= 15: css, lbl, ikon = "kc-al",   "GÜÇLÜ AL",    "💚"
-    elif skor >= 12: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
-    elif skor >= 7:  css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
+    # V16: 22 filtre → eşikler orantılı: %82/%68/%45
+    if   skor >= 18: css, lbl, ikon = "kc-al",   "GÜÇLÜ AL",    "💚"
+    elif skor >= 15: css, lbl, ikon = "kc-pos",  "OLUMLU",      "🟢"
+    elif skor >= 10: css, lbl, ikon = "kc-notr", "NÖTR / İZLE", "🟡"
     else:            css, lbl, ikon = "kc-sat",  "BEKLE / SAT", "🔴"
     return (f"<div class='karar-card {css}'>"
             f"<div class='karar-lbl'>Kompozit Karar — {skor}/{n} sinyal aktif</div>"
@@ -849,7 +827,7 @@ def metric_grid(*cards):
 def sec_div(text):
     return f"<div class='sec-divider'>{text}</div>"
 
-def level_rows_html(price, supports, resistances):
+def level_rows_html(price, supports, resistances, vwap_val=None):
     html = ""
     for p, tc in reversed(resistances):
         dist  = (p / price - 1) * 100
@@ -862,6 +840,14 @@ def level_rows_html(price, supports, resistances):
              f"<span class='lv-lbl'>Güncel</span>"
              f"<span class='lv-val'>{price:.2f} TL</span>"
              f"<span class='lv-dist'>—</span></div>")
+    # V16: VWAP seviyesi destek/direnç tabloya eklendi
+    if vwap_val is not None and not pd.isna(vwap_val):
+        vwap_dist = (price / vwap_val - 1) * 100
+        vwap_side = "üstü ✅" if price >= vwap_val else "altı ⚠️"
+        html += (f"<div class='level-row vwap'>"
+                 f"<span class='lv-lbl'>VWAP ({vwap_side})</span>"
+                 f"<span class='lv-val'>{vwap_val:.2f} TL</span>"
+                 f"<span class='lv-dist'>{vwap_dist:+.2f}%</span></div>")
     for p, tc in supports:
         dist  = (price / p - 1) * 100
         touch = f" ★{tc}" if tc >= 2 else ""
@@ -908,7 +894,6 @@ def vol_bar_html(vol_now, vol_ma, vol_ratio, vol_confirmed, vol_pct):
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 xu100  = get_xu100()
 
-# Breadth bilgisi varsa alıyoruz (scan sonrası güncellenir)
 _breadth_pct = None
 if st.session_state.breadth:
     b = st.session_state.breadth
@@ -921,7 +906,6 @@ with st.sidebar:
     st.header("⚙️ Kontrol Paneli")
     st.markdown(regime_html(regime), unsafe_allow_html=True)
 
-    # V14: MHS özeti sidebar'da
     mhs_score, mhs_detail = market_health_score(xu100, _breadth_pct)
     st.markdown(
         f"<div style='background:#0d1421;border-radius:5px;padding:5px 10px;"
@@ -976,7 +960,7 @@ df = get_data(secilen)
 # ══ SOL: SCANNER ══════════════════════════════════════════════════════════════
 with col_l:
     st.markdown("### 🚀 Tarayıcı")
-    st.caption("⏱️ 15dk gecikmeli  ·  V15: RSI%/ADX Slope/Sektör RS/ATR%/VCP dahil")
+    st.caption("⏱️ 15dk gecikmeli  ·  V16: DI Spread / OBV Breakout / VWAP dahil")
 
     if st.button("Tüm Listeyi Tara"):
         st.session_state.scan_rows = []
@@ -996,16 +980,21 @@ with col_l:
                 htf_val  = htf_trend(t)
                 htf_icon = "🟢" if htf_val is True else ("🔴" if htf_val is False else "⚪")
 
-                adx_val  = float(d["ADX"].iloc[-1])  if "ADX"     in d.columns else 0
+                adx_val  = float(d["ADX"].iloc[-1])     if "ADX"     in d.columns else 0
                 pdi      = float(d["PlusDI"].iloc[-1])  if "PlusDI"  in d.columns else 0
                 mdi      = float(d["MinusDI"].iloc[-1]) if "MinusDI" in d.columns else 0
-                adx_ok   = adx_val > ADX_THRESHOLD and pdi > mdi
+                # V16: DI Spread dahil ADX ikonu
+                di_sp    = pdi - mdi
+                adx_ok   = adx_val > ADX_THRESHOLD and pdi > mdi and di_sp > DI_SPREAD_MIN
                 adx_icon = ("💪" if adx_ok else ("⚠️" if adx_val > ADX_THRESHOLD else "·"))
 
-                # V14: OBV sütunu
                 obv_ok   = ("OBV" in d.columns and "OBV_MA20" in d.columns and
                             float(d["OBV"].iloc[-1]) > float(d["OBV_MA20"].iloc[-1]))
-                obv_icon = "📈" if obv_ok else "📉"
+                # V16: OBV Breakout ekstra kontrol
+                obv_brk  = ("OBV_High20" in d.columns and
+                            float(d["OBV"].iloc[-1]) > float(d["OBV_High20"].iloc[-1]))
+                obv_icon = ("🚀" if (obv_ok and obv_brk) else
+                            "📈" if obv_ok else "📉")
 
                 trend_up = float(d["Close"].iloc[-1]) > float(d["SMA20"].iloc[-1])
                 if trend_up: above_count += 1
@@ -1025,7 +1014,7 @@ with col_l:
         prog.empty()
         st.session_state.scan_rows = rows
         st.session_state.breadth   = {"above": above_count, "total": len(rows)}
-        st.rerun()  # Breadth güncellendi → regime yeniden hesaplansın
+        st.rerun()
 
     if st.session_state.breadth:
         b = st.session_state.breadth
@@ -1058,7 +1047,13 @@ with col_c:
             x=df.index, y=df["SMA20"], mode="lines",
             name="SMA20", line=dict(color="#38bdf8", width=1.5)
         ))
-        # V14: OBV alt panel
+        # V16: VWAP grafikte gösterildi
+        if "VWAP" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["VWAP"], mode="lines",
+                name="VWAP", line=dict(color="#a78bfa", width=1.2, dash="dot"),
+                opacity=0.85
+            ))
         if "OBV" in df.columns:
             fig.add_trace(go.Scatter(
                 x=df.index, y=df["OBV"], mode="lines",
@@ -1109,6 +1104,11 @@ with col_r:
         obv_ma   = float(df["OBV_MA20"].iloc[-1])   if "OBV_MA20"  in df.columns else 0.0
         gap_pct  = float(df["GapPct"].iloc[-1])     if "GapPct"    in df.columns else 0.0
 
+        # V16: yeni gösterge değerleri
+        di_spread_val  = float(df["DI_Spread"].iloc[-1])  if "DI_Spread"  in df.columns else (plus_di - minus_di)
+        obv_high20     = float(df["OBV_High20"].iloc[-1]) if "OBV_High20" in df.columns else obv_now
+        vwap_val       = float(df["VWAP"].iloc[-1])        if "VWAP"       in df.columns else None
+
         sqz_now               = bool(bollinger_squeeze(df["Close"]).iloc[-1])
         rs_above, rs_sl_s, _  = relative_strength_full(df["Close"], xu100)
         rs_now                = bool(rs_above.iloc[-1])  if rs_above is not None else None
@@ -1126,35 +1126,35 @@ with col_r:
         vol_confirmed = (vol_ratio >= RVOL_THRESHOLD) and (fiyat > fiyat_p)
         rsi_ok        = 50 < rsi < 70
         adx_ok        = adx_val > ADX_THRESHOLD
-        adx_dir_ok    = plus_di > minus_di          # V14: ADX yön filtresi
+        adx_dir_ok    = plus_di > minus_di
         vol_pct_ok    = vol_pct > 70
         atr_exp_ok    = atr_exp > 0
-        obv_ok        = obv_now > obv_ma             # V14: OBV filtresi
-        gap_ok        = gap_pct < GAP_MAX_PCT        # V14: Gap filtresi
+        obv_ok        = obv_now > obv_ma
+        gap_ok        = gap_pct < GAP_MAX_PCT
 
-        # ── V15: Yeni gösterge değerleri ─────────────────────────────────────
-        rsi_pct_val   = float(df["RSI_Pct"].iloc[-1])  if "RSI_Pct"   in df.columns else 50.0
+        # V15 değerleri
+        rsi_pct_val   = float(df["RSI_Pct"].iloc[-1])   if "RSI_Pct"   in df.columns else 50.0
         adx_slope_val = float(df["ADX_Slope"].iloc[-1]) if "ADX_Slope" in df.columns else 0.0
         atr_pct_val   = float(df["ATR_Pct"].iloc[-1])   if "ATR_Pct"   in df.columns else 50.0
-
-        # V15: RSI Percentile — RSI seviyesinden çok yüzdelik konum önemli
-        rsi_pct_ok    = rsi_pct_val > 60  # Son 252 barda üst %40'ta
-
-        # V15: ADX Slope — eğim pozitif → trend güçleniyor
+        rsi_pct_ok    = rsi_pct_val > 60
         adx_slope_ok  = adx_slope_val > 0
-
-        # V15: ATR Percentile — dinamik volatilite eşiği (sabit bant yerine)
-        # Üst %25 çok yüksek volatilite = riskli, alt %10 = henüz açılmamış
         atr_pct_ok    = 10 < atr_pct_val < 75
 
-        # V15: Sektör RS (çift RS)
         rs_xu100_ok, rs_sektor_ok, sektor_sym = sektor_rs(df["Close"], secilen, xu100)
-        # Sektör RS yoksa (sektör endeksi eşleşmiyorsa) filtreden muaf tut
         sektor_rs_ok  = (rs_sektor_ok is True) if rs_sektor_ok is not None else True
 
-        # V15: VCP Skoru
         vcp_s, vcp_price, vcp_vol, vcp_rs = vcp_score(df)
-        vcp_ok        = vcp_s >= 2  # En az 2/3 kriterin karşılanması
+        vcp_ok        = vcp_s >= 2
+
+        # ── V16: Yeni filtre mantığı ─────────────────────────────────────────
+        # 1. DI Spread: +DI - -DI > 10 (gerçek yükseliş gücü ayrışması)
+        di_spread_ok  = di_spread_val > DI_SPREAD_MIN
+
+        # 2. OBV Breakout: OBV son 20 barın maksimumunu kırıyor mu?
+        obv_brk_ok    = obv_now > obv_high20 if obv_high20 != 0 else False
+
+        # 3. VWAP: Close > günlük VWAP → kurumsal maliyet üstünde
+        vwap_ok       = (fiyat > vwap_val) if (vwap_val is not None and not pd.isna(vwap_val)) else None
 
         if   rsi >= 70: rz_lbl, rz_cls = "AŞIRI ALIM",  "dn"
         elif rsi >= 55: rz_lbl, rz_cls = "GÜÇLÜ BÖLGE", "up"
@@ -1163,32 +1163,32 @@ with col_r:
         elif rsi >= 30: rz_lbl, rz_cls = "ZAYIF BÖLGE", "dn"
         else:           rz_lbl, rz_cls = "AŞIRI SATIM", "wn"
 
-        # 19 filtre kompozit skor (V15)
+        # 22 filtre kompozit skor (V16)
         sinyaller = [
-            fiyat > sma,          # 1.  Trend (15m)
-            rsi_ok,               # 2.  RSI bandı 50-70
-            rs_now is True,       # 3.  RS güçlü (XU100)
-            rs_slope_now is True, # 4.  RS hızlanıyor
-            sqz_now,              # 5.  Squeeze
-            vol_confirmed,        # 6.  Hacim doğrulama
-            htf_now is True,      # 7.  4H HTF
-            brk_now,              # 8.  Breakout
-            atr_ok,               # 9.  ATR% bölgesi (sabit bant)
-            adx_ok,               # 10. ADX > 25
-            adx_dir_ok,           # 11. +DI > -DI (V14 yeni)
-            vol_pct_ok,           # 12. Volume Percentile > 70
-            atr_exp_ok,           # 13. ATR Expansion
-            obv_ok,               # 14. OBV > OBV_MA20 (V14 yeni)
-            rsi_pct_ok,           # 15. RSI Percentile > 60 (V15 YENİ)
-            adx_slope_ok,         # 16. ADX Slope > 0 (V15 YENİ)
-            sektor_rs_ok,         # 17. Sektör RS (V15 YENİ)
-            atr_pct_ok,           # 18. ATR Percentile 10-75 (V15 YENİ)
-            vcp_ok,               # 19. VCP Skoru ≥ 2/3 (V15 YENİ)
-            # Gap filtresi sinyal skoru dışında tutulur — hard blocker olarak çalışır
+            fiyat > sma,                # 1.  Trend (15m)
+            rsi_ok,                     # 2.  RSI bandı 50-70
+            rs_now is True,             # 3.  RS güçlü (XU100)
+            rs_slope_now is True,       # 4.  RS hızlanıyor
+            sqz_now,                    # 5.  Squeeze
+            vol_confirmed,              # 6.  Hacim doğrulama
+            htf_now is True,            # 7.  4H HTF
+            brk_now,                    # 8.  Breakout
+            atr_ok,                     # 9.  ATR% bölgesi (sabit bant)
+            adx_ok,                     # 10. ADX > 25
+            adx_dir_ok,                 # 11. +DI > -DI
+            vol_pct_ok,                 # 12. Volume Percentile > 70
+            atr_exp_ok,                 # 13. ATR Expansion
+            obv_ok,                     # 14. OBV > OBV_MA20
+            rsi_pct_ok,                 # 15. RSI Percentile > 60 (V15)
+            adx_slope_ok,               # 16. ADX Slope > 0 (V15)
+            sektor_rs_ok,               # 17. Sektör RS (V15)
+            atr_pct_ok,                 # 18. ATR Percentile 10-75 (V15)
+            vcp_ok,                     # 19. VCP Skoru ≥ 2/3 (V15)
+            di_spread_ok,               # 20. DI Spread > 10 (V16 YENİ)
+            obv_brk_ok,                 # 21. OBV Breakout 20-bar (V16 YENİ)
+            vwap_ok is True,            # 22. VWAP üstü (V16 YENİ)
         ]
         skor = sum(sinyaller)
-
-        # V14: Gap blocker — gap varsa karar baskılanır
         gap_blocked = not gap_ok
 
         stop      = fiyat - atr * ATR_MULT
@@ -1197,11 +1197,13 @@ with col_r:
         reward_tl = hedef - fiyat
         rr_ratio  = reward_tl / risk_tl
 
-        # MHS (güncel breadth ile)
         mhs_score, mhs_detail = market_health_score(xu100, _breadth_pct)
         aktif_risk = regime["risk"]
 
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📐 Planner","🤖 Broker","📊 Backtest","🎯 Filtreler","🏥 MHS","🔬 V15 Pro"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "📐 Planner","🤖 Broker","📊 Backtest",
+            "🎯 Filtreler","🏥 MHS","🔬 V15 Pro","⚡ V16 Yeni"
+        ])
 
         # ╔══════════════════════════════════╗
         # ║  TAB 1 — PLANNER               ║
@@ -1213,6 +1215,21 @@ with col_r:
 
             if gap_blocked:
                 st.warning(f"⚠️ **GAP UYARISI** — Açılış gapi %{gap_pct*100:.2f} > %{GAP_MAX_PCT*100:.0f}  →  Pozisyon boyutunu küçültün veya bekleyin.")
+
+            # V16: VWAP durumu plannerda gösterildi
+            if vwap_val is not None and not pd.isna(vwap_val):
+                vwap_dist_pct = (fiyat / vwap_val - 1) * 100
+                vwap_cls = "#22c55e" if fiyat >= vwap_val else "#ef4444"
+                vwap_lbl = "üstünde ✅" if fiyat >= vwap_val else "altında ⚠️"
+                st.markdown(
+                    f"<div style='background:#0d1421;border-radius:5px;padding:5px 10px;"
+                    f"margin-bottom:6px;font-size:10.5px;border-left:3px solid #a78bfa'>"
+                    f"<span style='color:#a78bfa;font-weight:700'>VWAP</span>"
+                    f"  <span style='color:#94a3b8'>{vwap_val:.2f} TL</span>"
+                    f"  <span style='color:{vwap_cls};font-weight:700'>"
+                    f"Fiyat VWAP {vwap_lbl} ({vwap_dist_pct:+.2f}%)</span></div>",
+                    unsafe_allow_html=True
+                )
 
             st.markdown(metric_grid(
                 ("Giriş Fiyatı",   f"{fiyat:.2f} TL",       ""),
@@ -1255,6 +1272,9 @@ with col_r:
                 ("ADX (14)",        f"{adx_val:.1f}", "up" if adx_ok else "wn"),
                 ("ADX Slope",       f"{'↑' if adx_slope_ok else '↓'} {adx_slope_val:.2f}",
                  "up" if adx_slope_ok else "dn"),
+                ("DI Spread",       f"+{di_spread_val:.1f}", "up" if di_spread_ok else ("wn" if di_spread_val > 0 else "dn")),
+                ("VWAP",            f"{vwap_val:.2f}" if (vwap_val and not pd.isna(vwap_val)) else "—",
+                 "up" if (vwap_ok is True) else ("dn" if (vwap_ok is False) else "")),
                 ("ATR Percentile",  f"P{atr_pct_val:.0f}", "up" if atr_pct_ok else "wn"),
                 ("VCP Skoru",       f"{vcp_s}/3", "up" if vcp_ok else ("wn" if vcp_s == 1 else "dn")),
             ), unsafe_allow_html=True)
@@ -1265,14 +1285,15 @@ with col_r:
 
             st.markdown(sec_div("Destek & Direnç  (★ = çoklu test)"), unsafe_allow_html=True)
             if supports or resistances:
-                st.markdown(level_rows_html(fiyat, supports, resistances), unsafe_allow_html=True)
+                st.markdown(level_rows_html(fiyat, supports, resistances, vwap_val),
+                            unsafe_allow_html=True)
             else:
                 st.caption("Pivot bulunamadı.")
 
             st.markdown(sec_div("Risk / Ödül"), unsafe_allow_html=True)
             st.markdown(rr_bar_html(risk_tl, reward_tl, rr_ratio), unsafe_allow_html=True)
 
-            st.markdown(sec_div("Sinyal Detayı (14 Filtre)"), unsafe_allow_html=True)
+            st.markdown(sec_div("Sinyal Detayı (V16: 22 Filtre)"), unsafe_allow_html=True)
             rs_ab_h = (
                 f"<div class='sr unk'><span class='sl'>RS vs XU100</span>"
                 f"<span class='sv wn'>📡 Veri Yok</span></div>"
@@ -1324,7 +1345,34 @@ with col_r:
                              "📉 OBV < MA20 — Kurumsal Satış / Dağıtım") +
                 sig_row_html("Gap Filtresi",        gap_ok,
                              f"✅ Gap %{gap_pct*100:.2f} — Normal Açılış",
-                             f"⛔ Gap %{gap_pct*100:.2f} > %{GAP_MAX_PCT*100:.0f} — BLOKE"),
+                             f"⛔ Gap %{gap_pct*100:.2f} > %{GAP_MAX_PCT*100:.0f} — BLOKE") +
+                sig_row_html("RSI Percentile",     rsi_pct_ok,
+                             f"✅ P{rsi_pct_val:.0f} Güçlü Konum",
+                             f"📊 P{rsi_pct_val:.0f} Henüz Girmedi") +
+                sig_row_html("ADX Slope",          adx_slope_ok,
+                             f"📈 Trend Güçleniyor (+{adx_slope_val:.2f})",
+                             f"📉 Trend Zayıflıyor ({adx_slope_val:.2f})") +
+                sig_row_html("Sektör RS",          sektor_rs_ok if rs_sektor_ok is not None else None,
+                             f"💚 Sektör Lideri ({sektor_sym or '?'})",
+                             f"🔴 Sektör Geride ({sektor_sym or '?'})",
+                             none_txt="ℹ️ Sektör Endeksi Yok") +
+                sig_row_html("ATR Percentile",     atr_pct_ok,
+                             f"✅ P{atr_pct_val:.0f} İdeal Volatilite",
+                             f"⚠️ P{atr_pct_val:.0f} Bant Dışı") +
+                sig_row_html("VCP (Minervini)",     vcp_ok,
+                             f"💎 VCP {vcp_s}/3 — Pattern Hazır",
+                             f"⏳ VCP {vcp_s}/3 — Gelişiyor") +
+                # V16 yeni sinyaller
+                sig_row_html("DI Spread (V16)",    di_spread_ok,
+                             f"💪 +DI−−DI = {di_spread_val:.1f} > {DI_SPREAD_MIN} — Güçlü Ayrışma",
+                             f"⚠️ +DI−−DI = {di_spread_val:.1f} < {DI_SPREAD_MIN} — Zayıf Ayrışma") +
+                sig_row_html("OBV Breakout (V16)", obv_brk_ok,
+                             "🚀 OBV 20-bar Zirvesinde — Kurumsal Giriş!",
+                             "⏳ OBV Zirve Kırmadı — Birikim Devam") +
+                sig_row_html("VWAP Üstü (V16)",   vwap_ok,
+                             f"✅ Fiyat VWAP Üstünde ({vwap_val:.2f})" if (vwap_val and not pd.isna(vwap_val)) else "✅ VWAP Üstünde",
+                             f"❌ Fiyat VWAP Altında ({vwap_val:.2f})" if (vwap_val and not pd.isna(vwap_val)) else "❌ VWAP Altında",
+                             none_txt="📡 VWAP Hesaplanamadı"),
                 unsafe_allow_html=True
             )
             st.caption("⏱️ 15dk gecikmeli veri — giriş öncesi teyit alın.")
@@ -1334,7 +1382,7 @@ with col_r:
         # ╚══════════════════════════════════╝
         with tab3:
             st.caption(f"Maliyet: %{TRADE_COST*100:.2f}/işlem  ·  "
-                       f"17 giriş filtresi (V15)  ·  Çıkış: Trend/RS/Stop")
+                       f"20 giriş filtresi (V16)  ·  Çıkış: Trend/RS/Stop")
             res = run_backtest(df, xu100)
             if res.get("err"):
                 st.info(f"ℹ️ {res['err']}")
@@ -1363,7 +1411,7 @@ with col_r:
                 st.caption(f"⚠️ Kapanış fiyatı bazlı  ·  %{TRADE_COST*100:.2f} maliyet düşüldü.")
 
         # ╔══════════════════════════════════╗
-        # ║  TAB 4 — FİLTRELER             ║
+        # ║  TAB 4 — FİLTRELER (V15 koru)  ║
         # ╚══════════════════════════════════╝
         with tab4:
             evt = st.session_state.event_risks.get(secilen, "📡")
@@ -1383,41 +1431,30 @@ with col_r:
             else:                      st.warning("📉 Yavaşlıyor — Dikkat.")
 
             st.markdown("**4. ADX Trend Gücü**")
-            if adx_ok:
-                st.success(f"💪 ADX {adx_val:.1f} > {ADX_THRESHOLD} — Güçlü trend.")
-            else:
-                st.warning(f"⚠️ ADX {adx_val:.1f} < {ADX_THRESHOLD} — Trend zayıf, sinyal riskli.")
+            if adx_ok: st.success(f"💪 ADX {adx_val:.1f} > {ADX_THRESHOLD} — Güçlü trend.")
+            else:      st.warning(f"⚠️ ADX {adx_val:.1f} < {ADX_THRESHOLD} — Trend zayıf.")
 
-            st.markdown("**5. ADX Yönü (+DI / -DI)** — *V14 YENİ*")
-            if adx_dir_ok:
-                st.success(f"⬆️ +DI {plus_di:.1f} > -DI {minus_di:.1f} — Yükseliş yönlü trend.")
-            else:
-                st.error(f"⬇️ +DI {plus_di:.1f} < -DI {minus_di:.1f} — ADX güçlü olsa bile DÜŞÜŞ yönlü!")
+            st.markdown("**5. ADX Yönü (+DI / -DI)**")
+            if adx_dir_ok: st.success(f"⬆️ +DI {plus_di:.1f} > -DI {minus_di:.1f} — Yükseliş yönlü.")
+            else:          st.error(f"⬇️ +DI {plus_di:.1f} < -DI {minus_di:.1f} — Düşüş yönlü!")
 
-            st.markdown("**6. OBV Kurumsal Akış** — *V14 YENİ*")
-            if obv_ok:
-                st.success("📈 OBV > MA20 — Kurumsal alım ağırlıklı akış.")
-            else:
-                st.error("📉 OBV < MA20 — Kurumsal satış / dağıtım baskısı.")
+            st.markdown("**6. OBV Kurumsal Akış**")
+            if obv_ok: st.success("📈 OBV > MA20 — Kurumsal alım ağırlıklı.")
+            else:      st.error("📉 OBV < MA20 — Kurumsal satış / dağıtım baskısı.")
 
-            st.markdown("**7. Gap Filtresi** — *V14 YENİ*")
-            if gap_ok:
-                st.success(f"✅ Açılış gapi %{gap_pct*100:.2f} — Normal, sinyal geçerli.")
+            st.markdown("**7. Gap Filtresi**")
+            if gap_ok: st.success(f"✅ Gap %{gap_pct*100:.2f} — Normal, sinyal geçerli.")
             else:
-                st.error(f"⛔ Açılış gapi %{gap_pct*100:.2f} > %{GAP_MAX_PCT*100:.0f} — Sinyal BLOKE!")
-                st.caption("Gap; bilanço, KAP haberi veya bedelsiz sonrası oluşmuş olabilir. Kapanıştan sonra değerlendir.")
+                st.error(f"⛔ Gap %{gap_pct*100:.2f} > %{GAP_MAX_PCT*100:.0f} — Sinyal BLOKE!")
+                st.caption("Gap; bilanço, KAP haberi veya bedelsiz sonrası oluşmuş olabilir.")
 
             st.markdown("**8. Volume Percentile**")
-            if vol_pct_ok:
-                st.success(f"✅ P{vol_pct:.0f} — Son 250 mumun üst %30'unda.")
-            else:
-                st.info(f"📊 P{vol_pct:.0f} — Hacim kurumsal giriş eşiğinde değil.")
+            if vol_pct_ok: st.success(f"✅ P{vol_pct:.0f} — Son 250 mumun üst %30'unda.")
+            else:          st.info(f"📊 P{vol_pct:.0f} — Hacim kurumsal giriş eşiğinde değil.")
 
             st.markdown("**9. ATR Expansion**")
-            if atr_exp_ok:
-                st.success("📈 Volatilite açılıyor — Kırılım teyidi güçlü.")
-            else:
-                st.info("📉 Volatilite daralıyor — Sıkışma henüz açılmadı.")
+            if atr_exp_ok: st.success("📈 Volatilite açılıyor — Kırılım teyidi güçlü.")
+            else:          st.info("📉 Volatilite daralıyor — Sıkışma henüz açılmadı.")
 
             st.markdown("**10. 4H HTF Trend**")
             st.markdown(htf_html(htf_now, secilen), unsafe_allow_html=True)
@@ -1438,37 +1475,36 @@ with col_r:
             st.markdown("**14. Veri Tazeliği**")
             st.markdown(freshness_html(fr), unsafe_allow_html=True)
 
-            st.markdown("**15. RSI Percentile** — *V15 YENİ*")
+            st.markdown("**15. RSI Percentile** — *V15*")
             if rsi_pct_ok:
-                st.success(f"✅ P{rsi_pct_val:.0f} — RSI son 252 barda güçlü konumda (üst %40).")
+                st.success(f"✅ P{rsi_pct_val:.0f} — RSI son 252 barda güçlü konumda.")
             else:
-                st.info(f"📊 P{rsi_pct_val:.0f} — RSI henüz üst %40'a girmedi. RSI={rsi:.1f} tek başına yanıltıcı olabilir.")
+                st.info(f"📊 P{rsi_pct_val:.0f} — RSI henüz üst %40'a girmedi.")
 
-            st.markdown("**16. ADX Slope** — *V15 YENİ*")
+            st.markdown("**16. ADX Slope** — *V15*")
             if adx_slope_ok:
-                st.success(f"📈 ADX eğimi pozitif (+{adx_slope_val:.2f}) — Trend gücü artıyor, yanlış breakout riski düşük.")
+                st.success(f"📈 ADX eğimi pozitif (+{adx_slope_val:.2f}) — Trend gücü artıyor.")
             else:
-                st.warning(f"📉 ADX eğimi negatif ({adx_slope_val:.2f}) — ADX={adx_val:.1f} güçlü görünse de trend zayıflıyor olabilir.")
+                st.warning(f"📉 ADX eğimi negatif ({adx_slope_val:.2f}) — Trend zayıflıyor olabilir.")
 
-            st.markdown("**17. Sektör RS** — *V15 YENİ*")
+            st.markdown("**17. Sektör RS** — *V15*")
             if rs_sektor_ok is None:
                 st.info(f"ℹ️ {secilen} için sektör endeksi eşleşmesi yok — XU100 RS geçerli.")
             elif rs_sektor_ok:
                 st.success(f"💚 {secilen} sektör endeksinin ({sektor_sym}) üzerinde — Gerçek sektör lideri!")
             else:
-                st.error(f"🔴 {secilen} XU100'ü geçse bile sektörünü ({sektor_sym}) geçemiyor — Sektör lideri değil.")
-                st.caption("Örnek: GARAN, XU100'ü geçiyor ama XBANK'ı geçemiyorsa aslında banka sektöründe lider değil.")
+                st.error(f"🔴 {secilen} XU100'ü geçse bile sektörünü ({sektor_sym}) geçemiyor.")
 
-            st.markdown("**18. ATR Percentile** — *V15 YENİ*")
+            st.markdown("**18. ATR Percentile** — *V15*")
             atr_pct_lbl = ("Düşük — henüz açılmamış" if atr_pct_val <= 10
                            else "Yüksek risk — aşırı volatilite" if atr_pct_val >= 75
                            else "Uygun bölge")
             if atr_pct_ok:
-                st.success(f"✅ ATR Percentile P{atr_pct_val:.0f} — {atr_pct_lbl}. Dinamik volatilite bölgesi ideal.")
+                st.success(f"✅ ATR Percentile P{atr_pct_val:.0f} — {atr_pct_lbl}.")
             else:
-                st.warning(f"⚠️ ATR Percentile P{atr_pct_val:.0f} — {atr_pct_lbl}. Sabit bant yerine bu göstergeyi dikkate alın.")
+                st.warning(f"⚠️ ATR Percentile P{atr_pct_val:.0f} — {atr_pct_lbl}.")
 
-            st.markdown("**19. VCP Skoru (Minervini)** — *V15 YENİ*")
+            st.markdown("**19. VCP Skoru (Minervini)** — *V15*")
             vcp_detail = []
             if vcp_price: vcp_detail.append("✅ Fiyat volatilitesi daralıyor")
             else:         vcp_detail.append("❌ Fiyat volatilitesi henüz daralmıyor")
@@ -1476,29 +1512,24 @@ with col_r:
             else:         vcp_detail.append("❌ Hacim daralması yok")
             if vcp_rs:    vcp_detail.append("✅ Fiyat yükseliyor (RS gücü)")
             else:         vcp_detail.append("❌ Fiyat momentumu yok")
-            if vcp_ok:
-                st.success(f"💎 VCP Skoru {vcp_s}/3 — Daralan+Sıkışma Pattern. Patlama için ideal zemin!")
-            elif vcp_s == 1:
-                st.info(f"🔄 VCP Skoru {vcp_s}/3 — Kısmi. Pattern henüz olgunlaşmadı.")
-            else:
-                st.warning(f"⏳ VCP Skoru {vcp_s}/3 — Pattern yok. Sıkışma ve daralan hacim bekleniyor.")
-            for d in vcp_detail:
-                st.caption(d)
+            if vcp_ok:   st.success(f"💎 VCP {vcp_s}/3 — Pattern Hazır!")
+            elif vcp_s==1: st.info(f"🔄 VCP {vcp_s}/3 — Gelişiyor.")
+            else:          st.warning(f"⏳ VCP {vcp_s}/3 — Pattern yok.")
+            for d in vcp_detail: st.caption(d)
+
+            st.markdown("**20–22. V16 Yeni Filtreler** → ⚡ V16 Yeni sekmesine bakın")
 
         # ╔══════════════════════════════════╗
-        # ║  TAB 5 — MHS (V14 YENİ)        ║
+        # ║  TAB 5 — MHS                   ║
         # ╚══════════════════════════════════╝
         with tab5:
             st.markdown("##### 🏥 Market Health Score")
             st.caption("Piyasa sağlığını 5 kritere göre puanlar ve pozisyon büyüklüğünü otomatik ayarlar.")
-
             st.markdown(mhs_html(mhs_score, mhs_detail), unsafe_allow_html=True)
-
             st.markdown(metric_grid(
-                ("MHS Skoru",     f"{mhs_score} / 5",           "up" if mhs_score >= 4 else ("wn" if mhs_score >= 2 else "dn")),
-                ("Aktif Risk",    f"%{aktif_risk*100:.1f}",      "up" if aktif_risk == RISK_FULL else ("wn" if aktif_risk == RISK_HALF else "dn")),
+                ("MHS Skoru",  f"{mhs_score} / 5",    "up" if mhs_score >= 4 else ("wn" if mhs_score >= 2 else "dn")),
+                ("Aktif Risk", f"%{aktif_risk*100:.1f}", "up" if aktif_risk == RISK_FULL else ("wn" if aktif_risk == RISK_HALF else "dn")),
             ), unsafe_allow_html=True)
-
             st.markdown("**Risk Dağılımı:**")
             st.markdown(
                 f"<div class='sr ok'><span class='sl'>MHS 4-5 (Risk On)</span>"
@@ -1509,24 +1540,18 @@ with col_r:
                 f"<span class='sv dn'>%{RISK_OFF*100:.1f} — Küçük / Bekleme</span></div>",
                 unsafe_allow_html=True
             )
-
             if _breadth_pct is None:
-                st.info("💡 **İpucu:** 'Tüm Listeyi Tara' butonuna basarak Breadth verisi yüklensin — MHS Kriter 2 ve 3 daha doğru hesaplanır.")
-
+                st.info("💡 'Tüm Listeyi Tara' → Breadth verisi yüklensin.")
             st.markdown("**V14 Piyasa Rejimi:**")
             st.markdown(regime_html(regime), unsafe_allow_html=True)
-            st.caption(
-                "MHS 4-5 → Piyasa sağlıklı, tam risk alınabilir.  \n"
-                "MHS 2-3 → Dikkatli ol, pozisyon küçült.  \n"
-                "MHS 0-1 → Piyasadan çık ya da çok küçük pozisyon al."
-            )
+            st.caption("MHS 4-5 → Tam risk. MHS 2-3 → Dikkatli. MHS 0-1 → Çık / Bekle.")
+
         # ╔══════════════════════════════════╗
         # ║  TAB 6 — V15 PRO               ║
         # ╚══════════════════════════════════╝
         with tab6:
             st.markdown("##### 🔬 V15 Pro — Adaptif Sinyal Özeti")
-            st.caption("RSI Percentile · ADX Slope · Sektör RS · ATR Percentile · VCP — ChatGPT metodoloji önerileri.")
-
+            st.caption("RSI Percentile · ADX Slope · Sektör RS · ATR Percentile · VCP")
             st.markdown(metric_grid(
                 ("RSI (14)",        f"{rsi:.1f}",              rz_cls),
                 ("RSI Percentile",  f"P{rsi_pct_val:.0f}",    "up" if rsi_pct_ok else "wn"),
@@ -1537,7 +1562,6 @@ with col_r:
                 ("VCP Skoru",       f"{vcp_s}/3",             "up" if vcp_ok else ("wn" if vcp_s==1 else "dn")),
             ), unsafe_allow_html=True)
 
-            # RSI Percentile açıklama
             st.markdown(sec_div("RSI Percentile Yorumu"), unsafe_allow_html=True)
             st.markdown(
                 f"<div class='sr {'ok' if rsi_pct_ok else 'unk'}'>"
@@ -1548,52 +1572,45 @@ with col_r:
             )
             st.caption("RSI=62 tek başına anlamsız. Ama P92'deyse son 252 barda %92'lik üst konumda — çok anlamlı.")
 
-            # ADX Slope açıklama
             st.markdown(sec_div("ADX Slope Yorumu"), unsafe_allow_html=True)
-            adx_slope_renk = "up" if adx_slope_ok else "dn"
             st.markdown(
                 f"<div class='sr {'ok' if adx_slope_ok else 'nok'}'>"
                 f"<span class='sl'>ADX={adx_val:.1f} · Eğim {ADX_SLOPE_BARS} bar</span>"
-                f"<span class='sv {adx_slope_renk}'>"
+                f"<span class='sv {'up' if adx_slope_ok else 'dn'}'>"
                 f"{'↑ Trend güçleniyor' if adx_slope_ok else '↓ Trend zayıflıyor'} ({adx_slope_val:+.2f})</span></div>",
                 unsafe_allow_html=True
             )
-            st.caption("ADX=30 ama düşüyorsa trend güç kaybediyor. Slope=+pozitif olanlar false breakout'u temizler.")
+            st.caption("ADX=30 ama düşüyorsa trend güç kaybediyor. Slope pozitif olanlar false breakout'u temizler.")
 
-            # Sektör RS açıklama
             st.markdown(sec_div("Sektör RS — Çift Referans"), unsafe_allow_html=True)
             if rs_sektor_ok is None:
-                st.info(f"ℹ️ {secilen} için sektör haritasında eşleşme yok. XU100 RS kullanılıyor.")
+                st.info(f"ℹ️ {secilen} için sektör haritasında eşleşme yok.")
             else:
-                sek_state = rs_sektor_ok
-                sek_lbl   = f"✅ {secilen} > {sektor_sym or 'Sektör'}" if sek_state else f"❌ {secilen} < {sektor_sym or 'Sektör'}"
-                xu_lbl    = f"✅ {secilen} > XU100" if rs_xu100_ok else f"❌ {secilen} < XU100"
+                xu_lbl  = f"✅ {secilen} > XU100" if rs_xu100_ok else f"❌ {secilen} < XU100"
+                sek_lbl = f"✅ {secilen} > {sektor_sym or '?'}" if rs_sektor_ok else f"❌ {secilen} < {sektor_sym or '?'}"
                 st.markdown(
                     f"<div class='sr {'ok' if rs_xu100_ok else 'nok'}'>"
                     f"<span class='sl'>RS vs XU100</span>"
                     f"<span class='sv {'up' if rs_xu100_ok else 'dn'}'>{xu_lbl}</span></div>"
-                    f"<div class='sr {'ok' if sek_state else 'nok'}'>"
+                    f"<div class='sr {'ok' if rs_sektor_ok else 'nok'}'>"
                     f"<span class='sl'>RS vs Sektör ({sektor_sym or '?'})</span>"
-                    f"<span class='sv {'up' if sek_state else 'dn'}'>{sek_lbl}</span></div>",
+                    f"<span class='sv {'up' if rs_sektor_ok else 'dn'}'>{sek_lbl}</span></div>",
                     unsafe_allow_html=True
                 )
                 if rs_xu100_ok and not rs_sektor_ok:
-                    st.warning(f"⚠️ {secilen} XU100'ü geçiyor ama sektörünü ({sektor_sym}) geçemiyor. Gerçek anlamda lider değil!")
+                    st.warning(f"⚠️ {secilen} XU100'ü geçiyor ama sektörünü ({sektor_sym}) geçemiyor.")
                 elif rs_xu100_ok and rs_sektor_ok:
-                    st.success(f"💎 Çift RS pozitif — Hem sektör hem piyasa lideri. En kaliteli sinyal!")
+                    st.success(f"💎 Çift RS pozitif — Hem sektör hem piyasa lideri!")
 
-            # ATR Percentile açıklama
-            st.markdown(sec_div("ATR Percentile — Dinamik Volatilite"), unsafe_allow_html=True)
+            st.markdown(sec_div("ATR Percentile"), unsafe_allow_html=True)
             st.markdown(
                 f"<div class='sr {'ok' if atr_pct_ok else 'unk'}'>"
                 f"<span class='sl'>ATR Percentile (Son {ATR_PCT_LOOKBACK} bar)</span>"
                 f"<span class='sv {'up' if atr_pct_ok else 'wn'}'>P{atr_pct_val:.0f} — "
-                f"{'İdeal Bölge' if atr_pct_ok else ('Çok Düşük — Henüz Açılmadı' if atr_pct_val <= 10 else 'Çok Yüksek — Riskli')}</span></div>",
+                f"{'İdeal Bölge' if atr_pct_ok else ('Çok Düşük' if atr_pct_val <= 10 else 'Çok Yüksek')}</span></div>",
                 unsafe_allow_html=True
             )
-            st.caption("Trend başlangıcında ATR yükselir — bu normaldir. Sabit %1-6 bant yerine percentile daha adaptif.")
 
-            # VCP Skoru açıklama
             st.markdown(sec_div("VCP — Volatility Contraction Pattern"), unsafe_allow_html=True)
             vcp_css = "ok" if vcp_ok else ("unk" if vcp_s == 1 else "nok")
             vcp_cls = "up" if vcp_ok else ("wn" if vcp_s == 1 else "dn")
@@ -1610,7 +1627,138 @@ with col_r:
                 f"<span class='sv {'up' if vcp_rs else 'dn'}'>{'✅' if vcp_rs else '❌'}</span></div>",
                 unsafe_allow_html=True
             )
-            st.caption("VCP=2/3 veya 3/3 → Squeeze + Kırılım kombinasyonuyla en kaliteli giriş noktası.")
 
+        # ╔══════════════════════════════════╗
+        # ║  TAB 7 — V16 YENİ (3 filtre)   ║
+        # ╚══════════════════════════════════╝
+        with tab7:
+            st.markdown("##### ⚡ V16 — DI Spread · OBV Breakout · VWAP")
+            st.caption(
+                "ChatGPT analizinden seçilen 3 kritik filtre. "
+                "Bu üç filtre gerçek trend gücünü ve kurumsal para akışını ölçer."
+            )
+
+            # ── DI SPREAD ────────────────────────────────────────────────────
+            st.markdown(sec_div("① DI Spread Filtresi — Gerçek Trend Ayrışması"), unsafe_allow_html=True)
+            di_cls  = "ok" if di_spread_ok else "nok"
+            di_vcls = "up" if di_spread_ok else "dn"
+            st.markdown(
+                f"<div class='sr {di_cls}'>"
+                f"<span class='sl'>+DI − −DI Farkı (Eşik: >{DI_SPREAD_MIN})</span>"
+                f"<span class='sv {di_vcls}'>{di_spread_val:+.1f} — "
+                f"{'Güçlü Ayrışma 💪' if di_spread_ok else 'Zayıf Ayrışma ⚠️'}</span></div>",
+                unsafe_allow_html=True
+            )
+            st.markdown(metric_grid(
+                ("+DI",        f"{plus_di:.1f}",    "up"),
+                ("-DI",        f"{minus_di:.1f}",   "dn"),
+                ("Fark",       f"{di_spread_val:+.1f}", "up" if di_spread_ok else "dn"),
+                ("Eşik",       f"> {DI_SPREAD_MIN}", "wn"),
+            ), unsafe_allow_html=True)
+            if di_spread_ok:
+                st.success(
+                    f"💪 **Güçlü Ayrışma ({di_spread_val:.1f}):** +DI ile -DI arasındaki fark {DI_SPREAD_MIN}'in üstünde. "
+                    f"Bu, yükseliş yönünün gerçek anlamda baskın olduğunu gösterir. "
+                    f"ADX=28, +DI=42, -DI=15 gibi bir tablo çok daha güçlüdür.")
+            else:
+                st.warning(
+                    f"⚠️ **Zayıf Ayrışma ({di_spread_val:.1f}):** +DI ile -DI arasında yeterli fark yok. "
+                    f"Örnek: ADX=30, +DI=27, -DI=25 → ADX güçlü görünse de trend yönü belirsiz. "
+                    f"False breakout riski yüksek.")
+            st.caption("Neden önemli? ADX tek başına trend yönü söylemez. DI Spread olmadan ADX güçlü görünüp yanlış yönde olabilir.")
+
+            # ── OBV BREAKOUT ─────────────────────────────────────────────────
+            st.markdown(sec_div("② OBV Breakout — Kurumsal Para Girişi Teyidi"), unsafe_allow_html=True)
+            obv_cls  = "ok" if obv_brk_ok else ("unk" if obv_ok else "nok")
+            obv_vcls = "up" if obv_brk_ok else ("wn" if obv_ok else "dn")
+            st.markdown(
+                f"<div class='sr {obv_cls}'>"
+                f"<span class='sl'>OBV vs Son {OBV_BRK_LOOKBACK}-bar Zirvesi</span>"
+                f"<span class='sv {obv_vcls}'>"
+                f"{'🚀 Zirveyi Kırdı — Kurumsal Giriş!' if obv_brk_ok else ('📈 MA20 üstünde ama zirve yok' if obv_ok else '📉 OBV Zayıf')}"
+                f"</span></div>",
+                unsafe_allow_html=True
+            )
+            st.markdown(metric_grid(
+                ("OBV Şimdiki",  f"{obv_now:,.0f}",    "up" if obv_ok else "dn"),
+                ("OBV MA20",     f"{obv_ma:,.0f}",     ""),
+                ("OBV 20-bar Max", f"{obv_high20:,.0f}", "wn"),
+                ("Breakout",     "✅ Evet" if obv_brk_ok else "❌ Hayır",
+                 "up" if obv_brk_ok else "dn"),
+            ), unsafe_allow_html=True)
+            if obv_brk_ok:
+                st.success(
+                    "🚀 **OBV Yeni Zirve:** OBV son 20 barın maksimumunu kırdı. "
+                    "Bu, kurumsal para akışının ivme kazandığını ve fiyat kırılımını desteklediğini gösterir. "
+                    "En kaliteli hacim sinyali!")
+            elif obv_ok:
+                st.info(
+                    "📈 **OBV Pozitif ama Zirve Yok:** OBV MA20 üstünde ancak henüz "
+                    f"son {OBV_BRK_LOOKBACK} barın zirvesini kırmadı. "
+                    "Kurumsal birikim devam ediyor, kırılım için bekle.")
+            else:
+                st.warning(
+                    "📉 **OBV Zayıf:** OBV MA20 altında. Fiyat yükselirken OBV yükselmiyorsa "
+                    "bu dağıtım (distribution) işareti olabilir — dikkat!")
+            st.caption("V15'te OBV > MA20 yeterliydi. V16'da OBV'nin son 20 barın zirvesini kırması şartı eklendi — daha seçici.")
+
+            # ── VWAP ─────────────────────────────────────────────────────────
+            st.markdown(sec_div("③ VWAP Filtresi — Kurumsal Maliyet Seviyesi"), unsafe_allow_html=True)
+            if vwap_val is not None and not pd.isna(vwap_val):
+                vwap_dist_pct = (fiyat / vwap_val - 1) * 100
+                vw_cls  = "ok" if (fiyat >= vwap_val) else "nok"
+                vw_vcls = "up" if (fiyat >= vwap_val) else "dn"
+                vwap_lbl = "Fiyat VWAP Üstünde ✅" if fiyat >= vwap_val else "Fiyat VWAP Altında ❌"
+                st.markdown(
+                    f"<div class='sr {vw_cls}'>"
+                    f"<span class='sl'>VWAP = {vwap_val:.2f} TL  |  Fiyat = {fiyat:.2f} TL</span>"
+                    f"<span class='sv {vw_vcls}'>{vwap_lbl} ({vwap_dist_pct:+.2f}%)</span></div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(metric_grid(
+                    ("VWAP",           f"{vwap_val:.2f} TL",       ""),
+                    ("Fiyat",          f"{fiyat:.2f} TL",          "up" if fiyat >= vwap_val else "dn"),
+                    ("VWAP Farkı",     f"{vwap_dist_pct:+.2f}%",  "up" if fiyat >= vwap_val else "dn"),
+                    ("Konum",          "Üstünde" if fiyat >= vwap_val else "Altında",
+                     "up" if fiyat >= vwap_val else "dn"),
+                ), unsafe_allow_html=True)
+                if fiyat >= vwap_val:
+                    st.success(
+                        f"✅ **VWAP Üstü ({vwap_dist_pct:+.2f}%):** Fiyat günlük VWAP'ın üzerinde. "
+                        "VWAP, kurumsal yatırımcıların ortalama maliyet seviyesidir. "
+                        "Bu seviyenin üzerinde işlem görmek, alıcıların kontrolde olduğunu gösterir.")
+                else:
+                    st.error(
+                        f"❌ **VWAP Altı ({vwap_dist_pct:+.2f}%):** Fiyat günlük VWAP'ın altında. "
+                        "Kurumsal yatırımcıların çoğu zararda — satış baskısı devam edebilir. "
+                        "VWAP üzerine çıkış için beklemek önerilir.")
+                st.caption(
+                    "VWAP (Volume Weighted Average Price): Hacimle ağırlıklandırılmış ortalama fiyat. "
+                    "Her gün sıfırlanır. Kurumsal fonlar ve algoritmalar bu seviyeyi referans alır."
+                )
+            else:
+                st.warning("📡 VWAP hesaplanamadı — veri yeterli değil.")
+
+            # Özet bölümü
+            st.markdown(sec_div("V16 Özet Skoru (3/3)"), unsafe_allow_html=True)
+            v16_toplam = int(di_spread_ok) + int(obv_brk_ok) + int(vwap_ok is True)
+            v16_cls = "ok" if v16_toplam == 3 else ("unk" if v16_toplam >= 2 else "nok")
+            v16_vcls = "up" if v16_toplam == 3 else ("wn" if v16_toplam >= 2 else "dn")
+            v16_lbl = {3:"💎 Tüm V16 Filtreleri Geçti — En Kaliteli Sinyal!",
+                       2:"🟡 2/3 V16 Filtresi Geçti — Kısmi Onay",
+                       1:"⚠️ 1/3 V16 Filtresi — Dikkatli Ol",
+                       0:"🔴 V16 Filtreleri Geçilemedi — Bekle"}
+            st.markdown(
+                f"<div class='sr {v16_cls}'>"
+                f"<span class='sl'>V16 Toplam (DI Spread + OBV Brk + VWAP)</span>"
+                f"<span class='sv {v16_vcls}'>{v16_toplam}/3 — {v16_lbl[v16_toplam]}</span></div>",
+                unsafe_allow_html=True
+            )
+            st.caption(
+                "V16 = 22 filtre toplam.  \n"
+                f"✅ DI Spread > {DI_SPREAD_MIN}: {'Geçti' if di_spread_ok else 'Geçemedi'}  \n"
+                f"✅ OBV Breakout: {'Geçti' if obv_brk_ok else 'Geçemedi'}  \n"
+                f"✅ VWAP Üstü: {'Geçti' if (vwap_ok is True) else 'Geçemedi'}"
+            )
     else:
         st.warning("Seçili hisse için veri alınamadı.")
