@@ -159,12 +159,19 @@ VCP_LOOKBACK     = 60
 DI_SPREAD_MIN    = 10
 OBV_BRK_LOOKBACK = 20
 
-# V18 backtest sabitleri
-# NOT: yfinance 15m için max 60d destekler — 1y/15m çalışmaz
-# CASCADE: önce 60d/15m, yetmezse 2y/1h
+# ── V20 BACKTEST SABİTLERİ (düzeltildi) ─────────────────────────────────────
+# DÜZELTME #4 — MAX_HOLD_BARS
+#   Eski: 96  → 96×15m = 3.7 iş günü (trend yakalamak için ÇOK KISA)
+#   Yeni: 480 → 480×15m = 18.5 iş günü | 480×1h = 68 gün (makul)
+#   Kanıt: güçlü BIST trendleri 2-4 hafta sürer; 3.7 günde çıkış sistematik zarar
 BT_CORE_FILTERS  = 6       # backtest için sadeleştirilmiş filtre sayısı
-MAX_HOLD_BARS    = 96      # max pozisyon süresi: 96×15m ≈ 2 gün, 96×1h ≈ 4 gün
+MAX_HOLD_BARS    = 480     # DÜZELTİLDİ: 96→480 (96×15m=3.7gün çok kısa)
 TRAIL_ATR_MULT   = 2.0     # trailing stop: giriş ATR'ının 2 katı
+# DÜZELTME #6 — SMA20 GÜRÜLTÜLERİ FİLTRESİ
+#   Eski: r.Close < r.SMA20  (anlık kapanış < SMA20 → hemen çık)
+#   Yeni: r.Close < r.SMA20 × SMA_EXIT_BUFFER
+#   Sebep: SMA20 yakınında fiyat ±%1-2 salınır, her geri çekilmede çıkış churn yaratır
+SMA_EXIT_BUFFER  = 0.995   # DÜZELTİLDİ: SMA20'nin %0.5 altına düşmeden çıkma
 
 SEKTOR_MAP = {
     "AKBNK":"XBANK.IS","GARAN":"XBANK.IS","ISCTR":"XBANK.IS",
@@ -489,14 +496,17 @@ def run_backtest(ticker: str):
             # XU100 yoksa RS filtresi devre dışı
             rs_series = pd.Series(True, index=bt_df.index)
 
-        # ── Giriş/Çıkış döngüsü ────────────────────────────────────────────
-        pos        = False
-        buy_cost   = 0.0
-        trail_stop = 0.0
-        entry_atr  = 0.0
-        peak_price = 0.0
-        hold_bars  = 0
-        trades     = []
+        # ── Giriş/Çıkış döngüsü (V20 — 8 düzeltme uygulandı) ──────────────
+        pos               = False
+        buy_cost          = 0.0
+        trail_stop        = 0.0
+        entry_atr         = 0.0
+        peak_price        = 0.0
+        hold_bars         = 0
+        trades            = []
+        # DÜZELTME 2-3: BH için ilk giriş anını kaydet
+        first_entry_price = None
+        bh_buy_cost       = None
 
         bt = bt_df.copy()
         rs = rs_series.reindex(bt.index, fill_value=False)
@@ -506,19 +516,25 @@ def run_backtest(ticker: str):
                 continue
 
             if not pos:
-                # 6 core filtre
+                # 6 core filtre (değişmedi)
+                brk_ok = (r.Close > r.High20) if not pd.isna(r.High20) else False
+                rs_ok  = bool(rs.loc[idx]) if idx in rs.index else False
                 if (r.Close > r.SMA20
                         and 45 < r.RSI < 75
-                        and bool(rs.loc[idx]) if idx in rs.index else False
+                        and rs_ok
                         and r.ADX > 20
                         and r.PlusDI > r.MinusDI
-                        and (r.Close > r.High20 if not pd.isna(r.High20) else False)):
+                        and brk_ok):
                     pos        = True
                     buy_cost   = r.Close * (1 + TRADE_COST)
                     entry_atr  = r.ATR
                     trail_stop = r.Close - entry_atr * TRAIL_ATR_MULT
                     peak_price = r.Close
                     hold_bars  = 0
+                    # DÜZELTME 2-3: ilk giriş anı = BH başlangıcı
+                    if first_entry_price is None:
+                        first_entry_price = r.Close
+                        bh_buy_cost       = r.Close * (1 + TRADE_COST)
             else:
                 hold_bars += 1
                 # Trailing stop güncelle
@@ -529,8 +545,12 @@ def run_backtest(ticker: str):
                 exit_reason = None
                 if r.Close < trail_stop:
                     exit_reason = "TrailStop"
-                elif r.Close < r.SMA20:
+                # DÜZELTME 6: SMA20 çıkışına buffer ekle — gürültü filtrelenir
+                # Eski: r.Close < r.SMA20  → her kapanışta tetikleniyordu
+                # Yeni: r.Close < r.SMA20 × SMA_EXIT_BUFFER (%0.5 tolerans)
+                elif r.Close < r.SMA20 * SMA_EXIT_BUFFER:
                     exit_reason = "Trend"
+                # DÜZELTME 4: MAX_HOLD 96→480 (96×15m=3.7gün çok kısa)
                 elif hold_bars >= MAX_HOLD_BARS:
                     exit_reason = "MaxHold"
 
@@ -561,32 +581,60 @@ def run_backtest(ticker: str):
                 f"hisse tüm süre boyunca filtreleri karşılamadı."
             )}
 
-        pnls     = [t["pnl"] for t in trades]
-        wins     = [p for p in pnls if p > 0]
-        losses   = [p for p in pnls if p < 0]
-        pf       = sum(wins) / abs(sum(losses)) if losses else float("inf")
-        cum      = pd.Series(pnls).cumsum()
-        max_dd   = (cum - cum.cummax()).min()
+        pnls   = [t["pnl"] for t in trades]
+        wins   = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        pf     = sum(wins) / abs(sum(losses)) if losses else float("inf")
+
+        # DÜZELTME 1: Bileşik getiri — sum(pnls) yerini aldı
+        # Eski (satır 585): sum(pnls)  — aritmetik toplam, bileşik değil
+        # Yeni: her işlem sonrası sermaye çarpımsal büyür
+        equity = 1.0
+        equity_curve = [1.0]
+        for p in pnls:
+            equity *= (1 + p / 100)
+            equity_curve.append(equity)
+        total_compound = (equity - 1) * 100
+
+        # DÜZELTME 5: Bileşik equity curve üzerinden gerçek drawdown
+        # Eski (satır 575-576): cumsum (aritmetik) → yanlış DD hesabı
+        # Yeni: equity curve / peak - 1
+        eq_s   = pd.Series(equity_curve)
+        max_dd = (eq_s / eq_s.cummax() - 1).min() * 100
+
         avg_bars = float(np.mean([t["bars"] for t in trades]))
-        bh       = (float(bt["Close"].iloc[-1]) / float(bt["Close"].iloc[0]) - 1) * 100
+
+        # DÜZELTME 2-3: BH adil karşılaştırma
+        # Eski (satır 578): bt.iloc[0] → bt.iloc[-1]  (veri başından, komisyonsuz)
+        # Yeni: ilk giriş anından, aynı komisyonla
+        last_price = float(bt["Close"].iloc[-1])
+        if first_entry_price is not None and bh_buy_cost is not None:
+            bh_sell_net = last_price * (1 - TRADE_COST)
+            bh_adil     = (bh_sell_net / bh_buy_cost - 1) * 100
+        else:
+            bh_adil     = 0.0
+        # Eski hatalı BH referans için sakla (karşılaştırma)
+        bh_eski = (last_price / float(bt["Close"].iloc[0]) - 1) * 100
 
         ec = {}
         for t in trades:
             ec[t["why"]] = ec.get(t["why"], 0) + 1
 
         return {
-            "total":    sum(pnls),
-            "wr":       len(wins) / len(trades) * 100,
-            "pf":       pf,
-            "bh":       bh,
-            "dd":       max_dd,
-            "n":        len(trades),
-            "avg_bars": avg_bars,
-            "ec":       ec,
-            "period":   bt_period,
-            "interval": bt_interval,
-            "bars":     len(bt_df),
-            "err":      None,
+            "total":        total_compound,  # DÜZELTME 1: bileşik getiri
+            "total_simple": sum(pnls),        # referans: eski yöntem
+            "wr":           len(wins) / len(trades) * 100,
+            "pf":           pf,
+            "bh":           bh_adil,          # DÜZELTME 2-3: adil BH
+            "bh_eski":      bh_eski,          # eski hatalı BH (referans)
+            "dd":           max_dd,           # DÜZELTME 5: bileşik DD
+            "n":            len(trades),
+            "avg_bars":     avg_bars,
+            "ec":           ec,
+            "period":       bt_period,
+            "interval":     bt_interval,
+            "bars":         len(bt_df),
+            "err":          None,
         }
 
     except Exception as e:
@@ -1317,34 +1365,65 @@ with col_r:
                 iv_lbl = "✅ 15m (tutarlı)" if interval == "15m" else "⚠️ 1h (fallback)"
                 st.markdown(
                     f"<div class='bt-info-box' style='margin-bottom:6px'>"
-                    f"<div class='bt-title'>Kullanılan Veri</div>"
+                    f"<div class='bt-title'>V20 — Kullanılan Veri & Düzeltmeler</div>"
                     f"<div class='bt-row'>"
                     f"<span class='bt-lbl'>Interval / Period</span>"
                     f"<span class='bt-val {iv_cls}'>{interval} / {period} ({res['bars']} bar)</span>"
-                    f"</div></div>",
+                    f"</div>"
+                    f"<div class='bt-row'>"
+                    f"<span class='bt-lbl'>Getiri Yöntemi</span>"
+                    f"<span class='bt-val up'>Bileşik (gerçek sermaye büyümesi)</span>"
+                    f"</div>"
+                    f"<div class='bt-row'>"
+                    f"<span class='bt-lbl'>Al-Bekle Karşılaştırma</span>"
+                    f"<span class='bt-val up'>İlk giriş anından, komisyon dahil</span>"
+                    f"</div>"
+                    f"<div class='bt-row'>"
+                    f"<span class='bt-lbl'>Max Hold</span>"
+                    f"<span class='bt-val up'>{MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26} iş günü)</span>"
+                    f"</div>"
+                    f"<div class='bt-row'>"
+                    f"<span class='bt-lbl'>SMA Çıkış</span>"
+                    f"<span class='bt-val up'>SMA20 × {SMA_EXIT_BUFFER} (buffer, churn önler)</span>"
+                    f"</div>"
+                    f"</div>",
                     unsafe_allow_html=True
                 )
 
                 st.markdown(metric_grid(
-                    ("Robot Getiri (net)", f"%{res['total']:.2f}", ret_cls),
-                    ("Al-Bekle",           f"%{res['bh']:.2f}",
+                    ("Robot Getiri (bileşik)", f"%{res['total']:.2f}", ret_cls),
+                    ("Al-Bekle (adil)",        f"%{res['bh']:.2f}",
                      "up" if res["bh"] >= 0 else "dn"),
-                    ("Win Rate",           f"%{res['wr']:.1f}",
+                    ("Win Rate",               f"%{res['wr']:.1f}",
                      "up" if res["wr"] >= 50 else "dn"),
-                    ("Profit Factor",      pf_str,
+                    ("Profit Factor",          pf_str,
                      "up" if res["pf"] > 1 else "dn"),
-                    ("Max Drawdown",       f"%{res['dd']:.1f}",   "dn"),
-                    ("İşlem Sayısı",       str(res["n"]),
+                    ("Max Drawdown",           f"%{res['dd']:.1f}", "dn"),
+                    ("İşlem Sayısı",           str(res["n"]),
                      "up" if res["n"] >= 5 else "wn"),
                 ), unsafe_allow_html=True)
 
+                # Referans: eski yöntemle karşılaştırma
+                simple_total = res.get("total_simple", res["total"])
+                bh_eski      = res.get("bh_eski", res["bh"])
+                st.markdown(
+                    f"<div class='bt-info-box' style='margin-top:4px'>"
+                    f"<div class='bt-title'>Eski Yöntem ile Karşılaştırma (referans)</div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Robot (eski aritmetik)</span>"
+                    f"<span class='bt-val {'up' if simple_total>=0 else 'dn'}'>%{simple_total:.2f}</span></div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Al-Bekle (eski, veri başından)</span>"
+                    f"<span class='bt-val {'up' if bh_eski>=0 else 'dn'}'>%{bh_eski:.2f}</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
                 st.markdown(metric_grid(
-                    ("Ort. Süre",   f"{res['avg_bars']:.0f} bar", ""),
+                    ("Ort. Süre",   f"{res['avg_bars']:.0f} bar",       ""),
                     ("Test Verisi", f"{res['bars']} bar / {period}", ""),
                 ), unsafe_allow_html=True)
 
                 if res["total"] > res["bh"]:
-                    st.success("💪 Robot Al-Bekle'yi Yendi! (Maliyet + Trailing Stop Dahil)")
+                    st.success("💪 Robot Al-Bekle'yi Yendi! (Bileşik Getiri, Adil BH, Maliyet Dahil)")
                 else:
                     st.warning("🐢 Al-Bekle Daha İyi Performans Gösterdi")
 
@@ -1354,9 +1433,9 @@ with col_r:
                     f"<div class='bt-title'>Çıkış Nedeni Dağılımı</div>"
                     f"<div class='bt-row'><span class='bt-lbl'>🛡️ Trailing Stop</span>"
                     f"<span class='bt-val'>{ec.get('TrailStop',0)}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>📉 Trend Kırıldı</span>"
+                    f"<div class='bt-row'><span class='bt-lbl'>📉 Trend (SMA×{SMA_EXIT_BUFFER})</span>"
                     f"<span class='bt-val'>{ec.get('Trend',0)}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>⏱️ Max Süre Doldu</span>"
+                    f"<div class='bt-row'><span class='bt-lbl'>⏱️ Max Süre ({MAX_HOLD_BARS} bar)</span>"
                     f"<span class='bt-val wn'>{ec.get('MaxHold',0)}</span></div>"
                     f"<div class='bt-row'><span class='bt-lbl'>📋 Veri Sonu</span>"
                     f"<span class='bt-val'>{ec.get('EndOfData',0)}</span></div>"
@@ -1364,10 +1443,11 @@ with col_r:
                     unsafe_allow_html=True
                 )
                 st.caption(
-                    f"⚠️ Kapanış fiyatı bazlı — gerçek sonuç %5-10 farklı olabilir.  \n"
-                    f"Giriş: Trend + RSI(45-75) + RS + ADX>20 + +DI>-DI + Breakout  \n"
-                    f"Canlı analizdeki 22 filtreden {BT_CORE_FILTERS} core filtre — "
-                    f"istatistiksel anlam için sadeleştirildi."
+                    f"V20 Düzeltmeleri: ①Bileşik getiri ②BH adil karşılaştırma (ilk giriş anı + komisyon) "
+                    f"③MAX_HOLD {MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26:.0f} iş günü) "
+                    f"④SMA20 çıkış buffer %{(1-SMA_EXIT_BUFFER)*100:.1f} ⑤DD bileşik equity curve  \n"
+                    f"Giriş: Trend+RSI(45-75)+RS+ADX>20++DI>-DI+Breakout  \n"
+                    f"Canlı 22 filtreden {BT_CORE_FILTERS} core — istatistiksel anlam için sadeleştirildi."
                 )
     else:
         st.warning("Seçili hisse için veri alınamadı.")
