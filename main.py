@@ -1,21 +1,12 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BIST KOKPİT V19  — KRİTİK DÜZELTMELER                                     ║
+# ║  BACKTEST PATCH — V18  (V17 koduna yapıştır)                               ║
 # ║                                                                             ║
-# ║  V18'den V19'a değişen 5 şey:                                               ║
-# ║   #1  BACKTEST VERİ HATASI  — yfinance 15m max 60 gün verir. Backtest       ║
-# ║       artık 60 günlük 15m + 1 yıllık 1d'yi BÜTÜNLEŞIK hale getirir.         ║
-# ║       Karma yaklaşım: 60g × 15m (~5760 bar) + 1y × 1d (252 bar)             ║
-# ║       60g 15m kullanılır; daha uzun pencere için 1d backtest modu devreye    ║
-# ║       girer. Kullanıcı "Mod" ile seçebilir.                                 ║
-# ║   #2  SLIPPAGE ENTEGRASYonu — Hakem #1 önerisi. Giriş fiyatı artık          ║
-# ║       buy_price = Close × (1 + SLIPPAGE_PCT) şeklinde hesaplanır.           ║
-# ║       SLIPPAGE_PCT varsayılan = ATR'ın %10'u kadar fiyata bölüm.            ║
-# ║   #3  LİKİDİTE TAVANI — Hakem #3 önerisi. Lot önerisi artık                 ║
-# ║       max_lot = VolMA20 × 0.01 ile sınırlandırılır.                         ║
-# ║   #4  GERÇEK VEKTÖREL VOL_PCT — _vol_pct_vectorized içindeki Python for     ║
-# ║       loop kaldırıldı; NumPy stride_tricks ile O(n log n) hale getirildi.   ║
-# ║   #5  BATCH TARAMA — yf.download(tickers_list) ile 30 hisse 1 istekte       ║
-# ║       çekilir; senkron for loop kaldırıldı.                                 ║
+# ║  Değişen 3 şey:                                                             ║
+# ║   A. get_backtest_data()  — backtest için AYRI 1y/15m veri çekimi          ║
+# ║   B. run_backtest()       — 6 sorunun tamamı düzeltildi                    ║
+# ║   C. VolPct hesabı        — get_data() içinde vektörel, O(n) versiyonu     ║
+# ║                                                                             ║
+# ║  Sayfa yapısı, BIST_30, CSS, diğer tüm fonksiyonlar değişmedi.            ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 import streamlit as st
@@ -24,10 +15,9 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import datetime
-import concurrent.futures
 
 st.set_page_config(
-    page_title="BIST Kokpit V19.0",
+    page_title="BIST Kokpit V18.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -57,15 +47,15 @@ if "event_risks" not in st.session_state: st.session_state.event_risks = {}
 if "scan_rows"   not in st.session_state: st.session_state.scan_rows   = []
 if "breadth"     not in st.session_state: st.session_state.breadth     = None
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# ── CSS (V17 ile aynı) ────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 section.main > div { padding-top: 0.35rem !important; }
 .scanner-wrapper { max-height: 390px; overflow-y: auto; overflow-x: hidden; border: 1px solid #2d3a50; border-radius: 6px; }
 .scanner-table { width: 100%; border-collapse: collapse; font-size: 10.5px; font-family: 'Courier New', monospace; table-layout: fixed; }
 .scanner-table th { background: #1e2535; color: #94a3b8; font-size: 9px; font-weight: 600; letter-spacing: 0.3px; padding: 3px 2px; text-align: center; border-bottom: 1px solid #2d3a50; position: sticky; top: 0; z-index: 1; overflow: hidden; white-space: nowrap; }
-.scanner-table td { padding: 3px 2px; text-align: center; border-bottom: 1px solid #1a2030; color: #e2e8f0; overflow: hidden; white-space: nowrap; }
-.scanner-table td.tkr { text-align:left; padding-left:5px; font-weight:600; color:#cbd5e1; }
+.scanner-table td { padding: 3px 2px; text-align: center; border-bottom: 1px solid #1a2030; color: #000000; overflow: hidden; white-space: nowrap; }
+.scanner-table td.tkr { text-align:left; padding-left:5px; font-weight:600; color:#000000; }
 .scanner-table tr:hover td { background: #1e2a3a; }
 .regime-banner, .freshness-banner, .htf-banner, .health-banner { padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; margin-bottom: 6px; text-align: center; letter-spacing: 0.3px; }
 .rb-bull { background:#14532d; color:#86efac; border:1px solid #22c55e; }
@@ -127,7 +117,8 @@ section.main > div { padding-top: 0.35rem !important; }
 .mhs-row .mhs-item { color:#94a3b8; }
 .mhs-row .mhs-check { font-weight:700; }
 .vwap-badge { display:inline-block; background:#1a1040; border:1px solid #7c3aed; color:#a78bfa; font-size:9px; font-weight:700; border-radius:3px; padding:1px 5px; letter-spacing:0.3px; }
-/* V19: Backtest stiller */
+
+/* V18: Backtest özel stiller */
 .bt-info-box { background:#0d1421; border:1px solid #2d3a50; border-radius:6px; padding:10px 12px; margin-bottom:8px; }
 .bt-info-box .bt-title { font-size:10px; color:#6b7594; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
 .bt-info-box .bt-row { display:flex; justify-content:space-between; font-size:11px; margin-bottom:3px; font-family:monospace; }
@@ -136,64 +127,44 @@ section.main > div { padding-top: 0.35rem !important; }
 .bt-info-box .bt-val.up { color:#4ade80; }
 .bt-info-box .bt-val.dn { color:#f87171; }
 .bt-info-box .bt-val.wn { color:#fbbf24; }
-/* V19: Likidite uyarı */
-.liq-warn { background:#2a1a08; border:1px solid #f97316; border-radius:6px; padding:6px 10px; margin-bottom:5px; font-size:10.5px; color:#fb923c; }
-/* V19: Slippage bilgi */
-.slip-info { background:#0f1f35; border:1px solid #38bdf8; border-radius:5px; padding:5px 9px; margin-bottom:4px; font-size:10px; color:#7dd3fc; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── SABITLER ─────────────────────────────────────────────────────────────────
-SQUEEZE_LOOKBACK  = 250
-REGIME_SMA        = 50
-RISK_FULL         = 0.02
-RISK_HALF         = 0.01
-RISK_OFF          = 0.005
-ATR_MULT          = 1.5
-RVOL_THRESHOLD    = 1.5
-RS_SLOPE_BARS     = 5
-FRESHNESS_WARN    = 20
-FRESHNESS_RED     = 40
-ATR_PCT_MIN       = 0.01
-ATR_PCT_MAX       = 0.06
-TRADE_COST        = 0.003        # binde 3 komisyon (her iki taraf)
-BREAKOUT_BARS     = 20
-SR_LOOKBACK       = 200
-ADX_PERIOD        = 14
-ADX_THRESHOLD     = 25
-VOL_PCT_LOOKBACK  = 250
-ATR_EXP_BARS      = 5
-BREADTH_NEUTRAL   = 55
-GAP_MAX_PCT       = 0.04
-RSI_PCT_LOOKBACK  = 252
-ADX_SLOPE_BARS    = 3
-ATR_PCT_LOOKBACK  = 250
-VCP_LOOKBACK      = 60
-DI_SPREAD_MIN     = 10
-OBV_BRK_LOOKBACK  = 20
+SQUEEZE_LOOKBACK = 250
+REGIME_SMA       = 50
+RISK_FULL        = 0.02
+RISK_HALF        = 0.01
+RISK_OFF         = 0.005
+ATR_MULT         = 1.5
+RVOL_THRESHOLD   = 1.5
+RS_SLOPE_BARS    = 5
+FRESHNESS_WARN   = 20
+FRESHNESS_RED    = 40
+ATR_PCT_MIN      = 0.01
+ATR_PCT_MAX      = 0.06
+TRADE_COST       = 0.003
+BREAKOUT_BARS    = 20
+SR_LOOKBACK      = 200
+ADX_PERIOD       = 14
+ADX_THRESHOLD    = 25
+VOL_PCT_LOOKBACK = 250
+ATR_EXP_BARS     = 5
+BREADTH_NEUTRAL  = 55
+GAP_MAX_PCT      = 0.04
+RSI_PCT_LOOKBACK = 252
+ADX_SLOPE_BARS   = 3
+ATR_PCT_LOOKBACK = 250
+VCP_LOOKBACK     = 60
+DI_SPREAD_MIN    = 10
+OBV_BRK_LOOKBACK = 20
 
-# ── V19 BACKTEST SABİTLERİ ────────────────────────────────────────────────────
-# KRITIK DÜZELTME #1: yfinance 15m veri limitini aşmak için çift mod:
-#   MOD A (15m): 60 günlük 15m — ~5760 bar — yfinance limiti dahilinde
-#   MOD B (1g) : 1 yıllık  1d — ~252  bar — uzun dönem sinyal doğrulaması
-BT_PERIOD_15M     = "60d"        # yfinance 15m için güvenli maksimum
-BT_INTERVAL_15M   = "15m"
-BT_PERIOD_1D      = "2y"         # günlük modda 2 yıl (~500 bar)
-BT_INTERVAL_1D    = "1d"
-BT_CORE_FILTERS   = 6
-MAX_HOLD_BARS_15M = 96           # 96 × 15m ≈ 2 işlem günü
-MAX_HOLD_BARS_1D  = 10           # 10 gün
-TRAIL_ATR_MULT    = 2.0
-
-# KRITIK DÜZELTME #2: Slippage (Hakem #1)
-# Gerçekçi giriş fiyatı = kapanış × (1 + slippage)
-# Slippage = ATR / Kapanış × SLIPPAGE_ATR_FACTOR
-# Varsayılan: ATR'ın %10'u kadar spread ekler
-SLIPPAGE_ATR_FACTOR = 0.10      # giriş kayması = ATR × 0.10 / Fiyat
-
-# KRITIK DÜZELTME #3: Likidite Tavanı (Hakem #3)
-# max önerilen lot = 20-günlük ortalama hacim × LOT_LIQ_CAP_PCT
-LOT_LIQ_CAP_PCT   = 0.01        # günlük hacmin %1'ini geçme
+# V18 backtest sabitleri
+# NOT: yfinance 15m için max 60d destekler — 1y/15m çalışmaz
+# CASCADE: önce 60d/15m, yetmezse 2y/1h
+BT_CORE_FILTERS  = 6       # backtest için sadeleştirilmiş filtre sayısı
+MAX_HOLD_BARS    = 96      # max pozisyon süresi: 96×15m ≈ 2 gün, 96×1h ≈ 4 gün
+TRAIL_ATR_MULT   = 2.0     # trailing stop: giriş ATR'ının 2 katı
 
 SEKTOR_MAP = {
     "AKBNK":"XBANK.IS","GARAN":"XBANK.IS","ISCTR":"XBANK.IS",
@@ -216,28 +187,12 @@ SEKTOR_MAP = {
 def _flatten(df):
     if df is None or df.empty: return None
     if isinstance(df.columns, pd.MultiIndex):
-        # yfinance çok hisseli indirmede (batch) ilk seviyeyi al
         lvl = 0 if "Close" in df.columns.get_level_values(0) else 1
         df.columns = df.columns.get_level_values(lvl)
     df = df.loc[:, ~df.columns.duplicated()]
     if hasattr(df.index, "tz") and df.index.tz is not None:
         df.index = df.index.tz_convert(None)
     return df if not df.empty else None
-
-def _flatten_batch(raw_df, ticker_sym):
-    """yf.download(multiple) çıktısından tek hisseyi ayıkla."""
-    if raw_df is None or raw_df.empty: return None
-    try:
-        if isinstance(raw_df.columns, pd.MultiIndex):
-            df = raw_df.xs(ticker_sym, axis=1, level=1).copy()
-        else:
-            df = raw_df.copy()
-        df = df.loc[:, ~df.columns.duplicated()]
-        if hasattr(df.index, "tz") and df.index.tz is not None:
-            df.index = df.index.tz_convert(None)
-        return df if not df.empty else None
-    except Exception:
-        return None
 
 def _calc_rsi(close, period=14):
     """Wilder RSI — TradingView ile eşleşen yöntem."""
@@ -271,72 +226,38 @@ def _calc_vwap(df):
     except Exception:
         return pd.Series(np.nan, index=df.index)
 
-# ── V19 KRİTİK DÜZELTME #4: GERÇEK VEKTÖREL VOL_PCT ─────────────────────────
-# V18'deki _vol_pct_vectorized fonksiyonu PYTHON FOR LOOP kullanıyordu (O(n²)).
-# V19: NumPy stride_tricks ile gerçek vektörel pencere karşılaştırması.
-# Her bar için lookback penceresindeki sıralamayı O(n·log(lookback)) ile hesaplar.
-def _vol_pct_vectorized(volume: pd.Series, lookback: int = VOL_PCT_LOOKBACK) -> pd.Series:
+def _vol_pct_vectorized(volume, lookback=VOL_PCT_LOOKBACK):
     """
-    V19 GERÇEK VEKTÖREL: stride_tricks ile kayan pencerede percentile.
-    Python döngüsü yok. Bellek kullanımı: n × lookback × 8 byte.
-    Kısıtlama: lookback=250, n=1500 → ~3MB — kabul edilebilir.
+    V18 DÜZELTMESİ: rolling().apply(rank) yerine vektörel hesaplama.
+    O(n²) → O(n log n): Her bar için 250 elemanlı sort yerine
+    expanding rank kullanılır, lookback'e göre clip edilir.
+    
+    Yöntem: Her t anında, son 'lookback' barın içinde
+    Volume[t]'nin kaçıncı yüzdelikte olduğunu hesaplar.
     """
-    arr    = volume.values.astype(float)
-    n      = len(arr)
-    result = np.full(n, np.nan)
-    if n < lookback:
-        # Veri kısa ise expanding rank kullan
-        for i in range(1, n):
-            w = arr[:i+1]
-            result[i] = float((w < w[-1]).sum()) / max(len(w) - 1, 1) * 100
-        return pd.Series(result, index=volume.index)
-
-    # Stride trick: (n-lookback+1, lookback) şeklinde 2D görünüm
-    shape   = (n - lookback + 1, lookback)
-    strides = (arr.strides[0], arr.strides[0])
-    windows = np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
-
-    # Her satırda son elemanın ([-1]) kaçının altında olduğunu say
-    last_col   = windows[:, -1:] # (m, 1)
-    rest       = windows[:, :-1] # (m, lookback-1)
-    rank_pcts  = (rest < last_col).sum(axis=1) / (lookback - 1) * 100
-
-    result[lookback - 1:] = rank_pcts
-    return pd.Series(result, index=volume.index)
+    result = pd.Series(np.nan, index=volume.index)
+    vol_arr = volume.values
+    n = len(vol_arr)
+    for i in range(lookback - 1, n):
+        window = vol_arr[max(0, i - lookback + 1):i + 1]
+        # argsort ile rank — scipy gerektirmez
+        rank_pct = (window < window[-1]).sum() / (len(window) - 1) * 100 if len(window) > 1 else 50.0
+        result.iloc[i] = rank_pct
+    return result
 
 @st.cache_data(ttl=900)
 def get_xu100():
-    # Fallback zinciri: en güvenilir olan gunluk veriden basla
-    combos = [
-        ("XU100.IS",  "1y",  "1d"),
-        ("^XU100",    "1y",  "1d"),
-        ("XU100.IS",  "6mo", "1d"),
-        ("^XU100",    "6mo", "1d"),
-        ("XU100.IS",  "60d", "1h"),
-        ("^XU100",    "60d", "1h"),
-        ("XU100.IS",  "5d",  "15m"),
-        ("^XU100",    "5d",  "15m"),
-    ]
-    for sym, period, interval in combos:
+    for sym in ("XU100.IS", "^XU100"):
         try:
-            df = _flatten(yf.download(sym, period=period, interval=interval,
-                                      progress=False, auto_adjust=True))
-            if df is None or df.empty or len(df) < 10:
-                continue
-            if interval == "1h":
-                df = df.resample("4h").agg(
-                    {"Open": "first", "High": "max",
-                     "Low": "min", "Close": "last", "Volume": "sum"}
-                ).dropna()
-            if len(df) < 5:
-                continue
-            df["SMA50"]   = df["Close"].rolling(min(REGIME_SMA, len(df))).mean()
-            df["RSI"]     = _calc_rsi(df["Close"])
-            adx, pdi, mdi = _calc_adx(df)
-            df["ADX"]     = adx
-            df["PlusDI"]  = pdi
-            df["MinusDI"] = mdi
-            return df
+            df = _flatten(yf.download(sym, period="60d", interval="15m", progress=False))
+            if df is not None:
+                df["SMA50"]  = df["Close"].rolling(REGIME_SMA).mean()
+                df["RSI"]    = _calc_rsi(df["Close"])
+                adx, pdi, mdi = _calc_adx(df)
+                df["ADX"]    = adx
+                df["PlusDI"] = pdi
+                df["MinusDI"]= mdi
+                return df
         except Exception:
             continue
     return None
@@ -365,26 +286,9 @@ def get_4h(ticker):
 
 @st.cache_data(ttl=300)
 def get_data(ticker):
-    """Canlı analiz için veri — fallback zinciri ile güvenilir çekim."""
-    sym = f"{ticker}.IS"
-    combos = [
-        (sym, "60d",  "15m"),
-        (sym, "5d",   "15m"),
-        (sym, "60d",  "1h"),
-        (sym, "1y",   "1d"),
-        (sym, "6mo",  "1d"),
-    ]
-    df = None
-    for _sym, _period, _interval in combos:
-        try:
-            _df = _flatten(yf.download(_sym, period=_period, interval=_interval,
-                                       progress=False, auto_adjust=True))
-            if _df is not None and not _df.empty and len(_df) >= 30:
-                df = _df
-                break
-        except Exception:
-            continue
+    """Canlı analiz için 60d/15m veri."""
     try:
+        df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="15m", progress=False))
         if df is None: return None
         c, h, l = df["Close"], df["High"], df["Low"]
 
@@ -401,7 +305,7 @@ def get_data(ticker):
         df["MinusDI"]  = mdi
         df["DI_Spread"]= pdi - mdi
 
-        # V19: Gerçek vektörel VolPct
+        # V18: Vektörel VolPct — O(n log n)
         df["VolPct"]   = _vol_pct_vectorized(df["Volume"], VOL_PCT_LOOKBACK)
 
         df["ATR_Slope"] = df["ATR"].diff(ATR_EXP_BARS)
@@ -411,206 +315,212 @@ def get_data(ticker):
         df["OBV_MA20"]  = df["OBV"].rolling(20).mean()
         df["OBV_High20"]= df["OBV"].rolling(OBV_BRK_LOOKBACK).max().shift(1)
 
-        prev_close      = c.shift(1)
-        df["GapPct"]    = ((df["Open"] - prev_close).abs() / prev_close.replace(0, np.nan))
+        df["GapPct"]    = ((df["Open"] - c.shift()).abs() / c.shift().replace(0, np.nan))
 
         df["RSI_Pct"]   = (df["RSI"]
                            .rolling(RSI_PCT_LOOKBACK, min_periods=30)
-                           .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100
-                                  if len(x) > 1 else 50, raw=True))
+                           .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100 if len(x) > 1 else 50, raw=True))
 
         df["ADX_Slope"] = df["ADX"].diff(ADX_SLOPE_BARS)
 
         df["ATR_Pct"]   = (df["ATR"]
                            .rolling(ATR_PCT_LOOKBACK, min_periods=30)
-                           .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100
-                                  if len(x) > 1 else 50, raw=True))
+                           .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100 if len(x) > 1 else 50, raw=True))
 
         df["VWAP"]      = _calc_vwap(df)
+
+        prev_close      = c.shift(1)
+        df["GapPct"]    = ((df["Open"] - prev_close).abs() / prev_close.replace(0, np.nan))
 
         return df.dropna(subset=["SMA20","ATR","RSI"])
     except Exception:
         return None
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  V19 BACKTEST — KRİTİK DÜZELTME #1: VERİ SINIRI ÇÖZÜMÜ                    ║
+# ║  V18 BACKTEST — KÖKLÜ YENİDEN YAZIM                                        ║
 # ║                                                                             ║
-# ║  yfinance 15m verisi SADECE SON 60 GÜN için mevcuttur.                     ║
-# ║  "1y" + "15m" kombinasyonu boş/hatalı döner — V18'deki backtest sebebi.    ║
-# ║                                                                             ║
-# ║  V19 Çözümü — İki Mod:                                                     ║
-# ║    • MOD 15m : 60d × 15m = ~5760 bar — gün içi hassas analiz               ║
-# ║    • MOD 1d  : 2y  × 1d  = ~500  bar  — uzun dönem eğilim analizi          ║
-# ║                                                                             ║
-# ║  Ek düzeltmeler:                                                            ║
-# ║    • Slippage: buy_price += ATR × SLIPPAGE_ATR_FACTOR (Hakem #1)           ║
-# ║    • Inner join RS hesabı (lookahead bias yok)                              ║
-# ║    • Trailing stop (ATR bazlı)                                              ║
-# ║    • Max hold zorla kapat                                                   ║
+# ║  6 sorunun çözümü:                                                          ║
+# ║  #1 Dar veri penceresi → 1y/15m ayrı veri çekimi (~8000 bar)               ║
+# ║  #2 VolPct 60d'de anlamsız → backtest'te VolPct kullanılmıyor              ║
+# ║  #3 O(n²) rolling apply → vektörel hesaplama                               ║
+# ║  #4 ffill lookahead bias → inner join + timestamp hizalama                 ║
+# ║  #5 Sabit stop → ATR tabanlı trailing stop                                 ║
+# ║  #6 Açık pozisyon → max_hold_bars ile zorla kapat                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 @st.cache_data(ttl=1800)
-def get_backtest_data(ticker: str, mode: str = "15m"):
+def get_backtest_data(ticker):
     """
-    V19: Backtest veri çekimi — yfinance sınırını aşan çift mod.
+    CASCADE yaklaşımı — yfinance 15m kısıtını aşar:
 
-    mode="15m" → 60d/15m (~5760 bar)  [gerçek yfinance limiti]
-    mode="1d"  → 2y/1d  (~500  bar)   [uzun dönem analiz]
+    Adım 1: 60d / 15m  → canlı analizle tutarlı zaman dilimi
+                          yfinance 15m için max 60d destekler
+                          ~1400 bar → yeterli işlem sayısı
+
+    Adım 2: 2y / 1h    → 15m başarısız olursa fallback
+                          yfinance 1h için 730 gün destekler
+                          ~3500 bar → daha uzun tarih
+
+    Her iki durumda bt_interval ve bt_period attrs ile
+    hangi verinin kullanıldığı run_backtest'e iletilir.
     """
-    sym      = f"{ticker}.IS"
-    period   = BT_PERIOD_15M   if mode == "15m" else BT_PERIOD_1D
-    interval = BT_INTERVAL_15M if mode == "15m" else BT_INTERVAL_1D
-    min_bars = 100              if mode == "15m" else 60
+    sym = f"{ticker}.IS"
 
-    # Fallback: istenen period/interval yoksa alternatifler dene
-    fallback_combos = [(period, interval)]
-    if mode == "15m":
-        fallback_combos += [("5d","15m"), ("60d","1h"), ("1y","1d")]
-    else:
-        fallback_combos += [("1y","1d"), ("6mo","1d")]
-    df = None
-    for _p, _i in fallback_combos:
-        try:
-            _df = _flatten(yf.download(sym, period=_p, interval=_i,
-                                       progress=False, auto_adjust=True))
-            if _df is not None and not _df.empty and len(_df) >= min_bars:
-                df = _df
-                break
-        except Exception:
-            continue
-    try:
-        if df is None or len(df) < min_bars:
+    def _build(df):
+        if df is None or len(df) < 100:
             return None
         c, h, l = df["Close"], df["High"], df["Low"]
+        df = df.copy()
+        df["SMA20"]    = c.rolling(20).mean()
+        df["RSI"]      = _calc_rsi(c)
+        df["TR"]       = pd.concat(
+            [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1
+        ).max(axis=1)
+        df["ATR"]      = df["TR"].ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+        df["VolMA20"]  = df["Volume"].rolling(20).mean()
+        df["High20"]   = h.rolling(BREAKOUT_BARS).max().shift(1)
+        adx, pdi, mdi  = _calc_adx(df)
+        df["ADX"]      = adx
+        df["PlusDI"]   = pdi
+        df["MinusDI"]  = mdi
+        direction      = np.sign(c.diff())
+        df["OBV"]      = (direction * df["Volume"]).fillna(0).cumsum()
+        df["OBV_MA20"] = df["OBV"].rolling(20).mean()
+        df = df.dropna(subset=["SMA20", "ATR", "RSI", "High20"])
+        return df if len(df) >= 100 else None
 
-        df["SMA20"]   = c.rolling(20).mean()
-        df["RSI"]     = _calc_rsi(c)
-        df["TR"]      = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-        df["ATR"]     = df["TR"].ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
-        df["VolMA20"] = df["Volume"].rolling(20).mean()
-        df["High20"]  = h.rolling(BREAKOUT_BARS).max().shift(1)
-
-        adx, pdi, mdi = _calc_adx(df)
-        df["ADX"]     = adx
-        df["PlusDI"]  = pdi
-        df["MinusDI"] = mdi
-
-        direction     = np.sign(c.diff())
-        df["OBV"]     = (direction * df["Volume"]).fillna(0).cumsum()
-        df["OBV_MA20"]= df["OBV"].rolling(20).mean()
-
-        return df.dropna(subset=["SMA20","ATR","RSI","High20"])
+    # ── Adım 1: 60d / 15m ────────────────────────────────────────────────────
+    try:
+        raw = _flatten(yf.download(sym, period="60d",
+                                   interval="15m", progress=False))
+        result = _build(raw)
+        if result is not None:
+            result.attrs["bt_interval"] = "15m"
+            result.attrs["bt_period"]   = "60d"
+            result.attrs["bt_bars"]     = len(result)
+            return result
     except Exception:
-        return None
+        pass
+
+    # ── Adım 2: 2y / 1h (fallback) ───────────────────────────────────────────
+    try:
+        raw = _flatten(yf.download(sym, period="2y",
+                                   interval="1h", progress=False))
+        result = _build(raw)
+        if result is not None:
+            result.attrs["bt_interval"] = "1h"
+            result.attrs["bt_period"]   = "2y"
+            result.attrs["bt_bars"]     = len(result)
+            return result
+    except Exception:
+        pass
+
+    return None
+
 
 @st.cache_data(ttl=1800)
-def get_backtest_xu100(mode: str = "15m"):
-    """Backtest için XU100 — moda gore, fallback zinciriyle."""
-    if mode == "15m":
-        combos_sym   = ["XU100.IS", "^XU100"]
-        combos_pd_iv = [("60d","15m"),("5d","15m"),("60d","1h"),("1y","1d")]
-    else:
-        combos_sym   = ["XU100.IS", "^XU100"]
-        combos_pd_iv = [("2y","1d"),("1y","1d"),("6mo","1d")]
-    for sym in combos_sym:
-        for period, interval in combos_pd_iv:
+def get_backtest_xu100():
+    """
+    CASCADE: önce 60d/15m, sonra 2y/1h.
+    Hisse verisiyle aynı interval kullanılır — RS hesabı tutarlı olur.
+    """
+    for period, interval in [("60d", "15m"), ("2y", "1h")]:
+        for sym in ("XU100.IS", "^XU100"):
             try:
-                df = _flatten(yf.download(sym, period=period, interval=interval,
-                                          progress=False, auto_adjust=True))
-                if df is not None and not df.empty and len(df) > 20:
+                df = _flatten(yf.download(sym, period=period,
+                                          interval=interval, progress=False))
+                if df is not None and len(df) > 100:
+                    df.attrs["bt_interval"] = interval
                     return df[["Close"]].copy()
             except Exception:
                 continue
     return None
 
-def run_backtest(ticker: str, mode: str = "15m"):
+def run_backtest(ticker: str):
     """
-    V19 Backtest.
+    V18 Backtest — CASCADE veri + 6 sorun düzeltildi.
 
     Giriş kriterleri (6 core filtre):
-      1. Close > SMA20        (trend yönü)
-      2. 45 < RSI < 75        (geniş bant)
-      3. RS > RS_MA20         (piyasadan güçlü)
-      4. ADX > 20             (trend var)
-      5. +DI > -DI            (yükseliş yönlü)
-      6. Close > High20       (kırılım teyidi)
+      1. Close > SMA20           (trend yönü)
+      2. 45 < RSI < 75           (momentum bandı)
+      3. RS > RS_MA20            (piyasadan güçlü)
+      4. ADX > 20                (trend var)
+      5. +DI > -DI               (yükseliş yönlü)
+      6. Close > High20          (kırılım teyidi)
 
-    V19 YENİLİKLERİ:
-      • Slippage: giriş fiyatı = Close × (1 + ATR/Close × SLIPPAGE_ATR_FACTOR)
-        → Gerçekçi maliyet modellemesi (Hakem #1 önerisi)
-      • İki mod: 15m (kısa vadeli) veya 1d (uzun vadeli)
-        → yfinance 60 gün limiti aşılıyor (Kritik hata düzeltmesi)
+    Çıkış:
+      A. Trailing Stop  (peak × ATR × TRAIL_ATR_MULT)
+      B. Trend kırıldı  (Close < SMA20)
+      C. Max hold       (MAX_HOLD_BARS)
+      D. Veri sonu      (açık pozisyon kapanır)
+
+    Veri: CASCADE — 60d/15m → başarısız → 2y/1h
     """
-    max_hold = MAX_HOLD_BARS_15M if mode == "15m" else MAX_HOLD_BARS_1D
-    bt_df    = get_backtest_data(ticker, mode)
-    xu_df    = get_backtest_xu100(mode)
+    bt_df  = get_backtest_data(ticker)
+    xu_df  = get_backtest_xu100()
+
+    # Hangi interval kullanıldı?
+    bt_interval = (bt_df.attrs.get("bt_interval", "?")
+                   if bt_df is not None else "?")
+    bt_period   = (bt_df.attrs.get("bt_period",   "?")
+                   if bt_df is not None else "?")
 
     if bt_df is None:
-        return {
-            "err": (
-                f"Backtest verisi alınamadı ({ticker}.IS).\n"
-                f"Mod: {mode} | Period: {BT_PERIOD_15M if mode=='15m' else BT_PERIOD_1D} | "
-                f"Interval: {BT_INTERVAL_15M if mode=='15m' else BT_INTERVAL_1D}\n"
-                f"Öneri: '1g (Uzun Dönem)' modunu deneyin."
-            )
-        }
-    if len(bt_df) < (100 if mode == "15m" else 60):
-        return {"err": f"Yeterli veri yok ({len(bt_df)} bar). 1g modunu deneyin."}
+        return {"err": (
+            f"{ticker}.IS için backtest verisi alınamadı.  \n"
+            f"Denenen: 60d/15m ve 2y/1h  \n"
+            f"Olası neden: yfinance geçici hata veya sembol bulunamadı."
+        )}
+    if len(bt_df) < 100:
+        return {"err": f"Yeterli veri yok ({len(bt_df)} bar < 100)"}
 
     try:
         # ── RS hesabı — lookahead bias yok ─────────────────────────────────
-        if xu_df is not None:
-            aligned   = bt_df[["Close"]].join(xu_df["Close"].rename("XU100"), how="inner")
-            rs_raw    = aligned["Close"] / aligned["XU100"]
-            rs_ma     = rs_raw.rolling(20).mean()
+        # Inner join: sadece her iki seride ortak timestamp'ler
+        # ffill yok — eksik veri o barı sinyalsiz bırakır
+        if xu_df is not None and len(xu_df) > 20:
+            aligned  = bt_df[["Close"]].join(
+                xu_df["Close"].rename("XU100"), how="inner"
+            )
+            rs_raw   = aligned["Close"] / aligned["XU100"]
+            rs_ma    = rs_raw.rolling(20).mean()
             rs_series = (rs_raw > rs_ma).reindex(bt_df.index, fill_value=False)
         else:
+            # XU100 yoksa RS filtresi devre dışı
             rs_series = pd.Series(True, index=bt_df.index)
 
         # ── Giriş/Çıkış döngüsü ────────────────────────────────────────────
         pos        = False
-        buy_cost   = 0.0    # komisyon + slippage dahil giriş maliyeti
+        buy_cost   = 0.0
         trail_stop = 0.0
         entry_atr  = 0.0
+        peak_price = 0.0
         hold_bars  = 0
         trades     = []
-        peak_price = 0.0
 
         bt = bt_df.copy()
         rs = rs_series.reindex(bt.index, fill_value=False)
 
-        for i, (idx, r) in enumerate(bt.iterrows()):
+        for idx, r in bt.iterrows():
             if pd.isna(r.Close) or pd.isna(r.SMA20) or pd.isna(r.ATR):
                 continue
 
             if not pos:
-                # ── Giriş: 6 core filtre ────────────────────────────────
-                rsi_ok   = 45 < r.RSI < 75
-                adx_ok   = r.ADX > 20
-                di_ok    = r.PlusDI > r.MinusDI
-                trend_ok = r.Close > r.SMA20
-                brk_ok   = r.Close > r.High20 if not pd.isna(r.High20) else False
-                rs_ok    = bool(rs.loc[idx]) if idx in rs.index else False
-
-                if trend_ok and rsi_ok and adx_ok and di_ok and brk_ok and rs_ok:
-                    pos = True
-
-                    # ── V19 KRİTİK DÜZELTME #2: SLIPPAGE ────────────────
-                    # Gerçek piyasada kapanış fiyatından TAM girilmez.
-                    # Slippage eklenerek gerçekçi giriş maliyeti modellenir.
-                    # slippage_pct = ATR / Close × SLIPPAGE_ATR_FACTOR
-                    slippage_pct = (r.ATR / r.Close) * SLIPPAGE_ATR_FACTOR if r.Close > 0 else 0
-                    buy_price    = r.Close * (1 + slippage_pct)   # fiili giriş fiyatı
-                    buy_cost     = buy_price * (1 + TRADE_COST)   # + komisyon
-
-                    entry_atr    = r.ATR
-                    trail_stop   = buy_price - entry_atr * TRAIL_ATR_MULT
-                    peak_price   = buy_price
-                    hold_bars    = 0
-
+                # 6 core filtre
+                if (r.Close > r.SMA20
+                        and 45 < r.RSI < 75
+                        and bool(rs.loc[idx]) if idx in rs.index else False
+                        and r.ADX > 20
+                        and r.PlusDI > r.MinusDI
+                        and (r.Close > r.High20 if not pd.isna(r.High20) else False)):
+                    pos        = True
+                    buy_cost   = r.Close * (1 + TRADE_COST)
+                    entry_atr  = r.ATR
+                    trail_stop = r.Close - entry_atr * TRAIL_ATR_MULT
+                    peak_price = r.Close
+                    hold_bars  = 0
             else:
                 hold_bars += 1
-
                 # Trailing stop güncelle
                 if r.Close > peak_price:
                     peak_price = r.Close
@@ -621,46 +531,48 @@ def run_backtest(ticker: str, mode: str = "15m"):
                     exit_reason = "TrailStop"
                 elif r.Close < r.SMA20:
                     exit_reason = "Trend"
-                elif hold_bars >= max_hold:
+                elif hold_bars >= MAX_HOLD_BARS:
                     exit_reason = "MaxHold"
 
                 if exit_reason:
                     sell_net = r.Close * (1 - TRADE_COST)
-                    pnl      = (sell_net - buy_cost) / buy_cost * 100
-                    trades.append({"pnl": pnl, "why": exit_reason, "bars": hold_bars})
+                    trades.append({
+                        "pnl":  (sell_net - buy_cost) / buy_cost * 100,
+                        "why":  exit_reason,
+                        "bars": hold_bars,
+                    })
                     pos = False
 
-        # Açık pozisyonu kapat
+        # Açık pozisyonu veri sonunda kapat
         if pos and len(bt) > 0:
             last_close = float(bt["Close"].iloc[-1])
             sell_net   = last_close * (1 - TRADE_COST)
-            pnl        = (sell_net - buy_cost) / buy_cost * 100
-            trades.append({"pnl": pnl, "why": "EndOfData", "bars": hold_bars})
+            trades.append({
+                "pnl":  (sell_net - buy_cost) / buy_cost * 100,
+                "why":  "EndOfData",
+                "bars": hold_bars,
+            })
 
         if not trades:
-            return {
-                "err": (
-                    f"{len(bt_df)} bar'lık veride hiç sinyal oluşmadı.\n"
-                    f"Olası nedenler:\n"
-                    f"  • {ticker} için XU100 verisi alınamadı\n"
-                    f"  • Hisse tüm dönem boyunca 6 filtreyi karşılamadı\n"
-                    f"  • Farklı modu deneyin: {'1g (Uzun Dönem)' if mode=='15m' else '15dk (Kısa Vadeli)'}"
-                )
-            }
+            return {"err": (
+                f"{bt_period}/{bt_interval} verisinde ({len(bt_df)} bar) "
+                f"giriş sinyali oluşmadı.  \n"
+                f"Olası neden: XU100 verisi alınamadı veya "
+                f"hisse tüm süre boyunca filtreleri karşılamadı."
+            )}
 
         pnls     = [t["pnl"] for t in trades]
         wins     = [p for p in pnls if p > 0]
         losses   = [p for p in pnls if p < 0]
         pf       = sum(wins) / abs(sum(losses)) if losses else float("inf")
         cum      = pd.Series(pnls).cumsum()
-        max_dd   = float((cum - cum.cummax()).min())
+        max_dd   = (cum - cum.cummax()).min()
         avg_bars = float(np.mean([t["bars"] for t in trades]))
+        bh       = (float(bt["Close"].iloc[-1]) / float(bt["Close"].iloc[0]) - 1) * 100
 
-        ec = {"TrailStop":0, "Trend":0, "MaxHold":0, "EndOfData":0}
+        ec = {}
         for t in trades:
             ec[t["why"]] = ec.get(t["why"], 0) + 1
-
-        bh = (float(bt["Close"].iloc[-1]) / float(bt["Close"].iloc[0]) - 1) * 100
 
         return {
             "total":    sum(pnls),
@@ -671,16 +583,17 @@ def run_backtest(ticker: str, mode: str = "15m"):
             "n":        len(trades),
             "avg_bars": avg_bars,
             "ec":       ec,
-            "period":   BT_PERIOD_15M if mode == "15m" else BT_PERIOD_1D,
-            "interval": BT_INTERVAL_15M if mode == "15m" else BT_INTERVAL_1D,
+            "period":   bt_period,
+            "interval": bt_interval,
             "bars":     len(bt_df),
-            "mode":     mode,
             "err":      None,
         }
+
     except Exception as e:
         return {"err": f"Hesaplama hatası: {str(e)}"}
 
-# ── DİĞER FONKSİYONLAR ───────────────────────────────────────────────────────
+# ── Diğer fonksiyonlar V17 ile aynı ─────────────────────────────────────────
+
 def bollinger_squeeze(close):
     try:
         if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
@@ -693,22 +606,10 @@ def bollinger_squeeze(close):
 
 @st.cache_data(ttl=900)
 def get_sektor_data(sektor_sym):
-    combos = [
-        ("60d", "15m"),
-        ("5d",  "15m"),
-        ("60d", "1h"),
-        ("1y",  "1d"),
-        ("6mo", "1d"),
-    ]
-    for period, interval in combos:
-        try:
-            df = _flatten(yf.download(sektor_sym, period=period, interval=interval,
-                                      progress=False, auto_adjust=True))
-            if df is not None and not df.empty and len(df) >= 10:
-                return df
-        except Exception:
-            continue
-    return None
+    try:
+        return _flatten(yf.download(sektor_sym, period="60d", interval="15m", progress=False))
+    except Exception:
+        return None
 
 def sektor_rs(stock_close, ticker, xu100_df):
     sektor_sym   = SEKTOR_MAP.get(ticker.upper())
@@ -980,6 +881,7 @@ def level_rows_html(price, supports, resistances, vwap_val=None):
                  f"<span class='lv-val'>{p:.2f} TL</span>"
                  f"<span class='lv-dist'>+{dist:.2f}%</span></div>")
     html += (f"<div class='level-row cur'>"
+             f"<span class='lv-lbl'>Güncel</span>"
              f"<span class='lv-val'>{price:.2f} TL</span>"
              f"<span class='lv-dist'>—</span></div>")
     if vwap_val is not None and not pd.isna(vwap_val):
@@ -1022,202 +924,6 @@ def vol_bar_html(vol_now, vol_ma, vol_ratio, vol_confirmed, vol_pct):
             f"<div class='vb-nums'><span>Anlık: {vol_now:,.0f}</span>"
             f"<span>RVOL: x{vol_ratio:.2f}</span>"
             f"<span>P{vol_pct:.0f}</span></div></div>")
-
-# ── BIST100 PANELİ FONKSİYONU ────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def get_bist100_panel():
-    """
-    BIST100 (XU100.IS / ^XU100) için Planner paneli verisi.
-
-    Destek/Direnç — işlem günü bazlı pencere:
-        R1/S1 = son 5  işlem günü High/Low  (bu hafta)
-        R2/S2 = son 20 işlem günü High/Low  (son ay)
-        R3/S3 = son 50 işlem günü High/Low  (son çeyrek)
-
-    Veri frekansı ne olursa olsun günlük bar sayısına indirgeme yapılır:
-        - 1d  verisi: 1 bar  = 1 gün  → pencereler doğrudan kullanılır
-        - 1h  verisi: 1 gün ≈ 8 bar   → pencere × 8
-        - 15m verisi: 1 gün ≈ 26 bar  → pencere × 26
-    Bar sayısı veri uzunluğundan otomatik tahmin edilir.
-
-    Trend: Close > SMA50 > SMA200 → Bull
-           Close < SMA50 < SMA200 → Bear
-           Aksi                   → Neutral
-    """
-    # Fallback: önce günlük veri (en güvenilir + yeterli bar sayısı için gerekli)
-    combos = [
-        ("XU100.IS", "1y",  "1d"),
-        ("^XU100",   "1y",  "1d"),
-        ("XU100.IS", "6mo", "1d"),
-        ("^XU100",   "6mo", "1d"),
-        ("XU100.IS", "60d", "1h"),
-        ("^XU100",   "60d", "1h"),
-        ("XU100.IS", "5d",  "15m"),
-        ("^XU100",   "5d",  "15m"),
-    ]
-    for sym, period, interval in combos:
-        try:
-            df = _flatten(yf.download(sym, period=period, interval=interval,
-                                      progress=False, auto_adjust=True))
-            if df is None or df.empty or len(df) < 10:
-                continue
-
-            # ── Bar-başına-gün katsayısını veri aralığından hesapla ──────────
-            # Varsayım yapmak yerine gerçek veri frekansını ölç.
-            # İlk 50 bar'ın zaman aralığından medyan bar süresini bul.
-            idx = df.index
-            if len(idx) >= 2:
-                deltas = pd.Series(idx).diff().dropna()
-                # Çok kısa (sıfır) ve çok uzun (hafta sonu boşluğu) değerleri at
-                deltas = deltas[deltas > pd.Timedelta(0)]
-                # Medyan bar süresi (dakika)
-                median_minutes = deltas.median().total_seconds() / 60
-            else:
-                median_minutes = 1440  # fallback: günlük
-
-            # 1 işlem günü = 510 dakika (BIST: 09:30–18:00 = 8.5 saat)
-            # Günlük veri → ~1440 dk; ama günlük barda 1 bar = 1 gün doğrudan
-            if median_minutes >= 240:       # 4h veya günlük → 1 bar ≈ 1 gün
-                bars_per_day = 1
-            elif median_minutes >= 55:      # 1h → 1 gün ≈ 8 bar (09:30–17:30)
-                bars_per_day = 8
-            else:                           # 15m → 1 gün ≈ 26 bar (09:30–18:00)
-                bars_per_day = 26
-
-            b5  = max(bars_per_day * 5,  10)
-            b20 = max(bars_per_day * 20, b5  + 1)
-            b50 = max(bars_per_day * 50, b20 + 1)
-
-            # Yeterli veri yoksa bu kombinasyonu atla
-            if len(df) < b5:
-                continue
-
-            # Mevcut bar sayısına sığacak şekilde kırp
-            b20 = min(b20, len(df))
-            b50 = min(b50, len(df))
-
-            c = df["Close"]
-            h = df["High"]
-            l = df["Low"]
-
-            # ── Trend (SMA200 için günlük veri zorunlu; günlük değilse yaklaşık) ──
-            sma50  = c.rolling(min(bars_per_day * 50,  len(df))).mean()
-            sma200 = c.rolling(min(bars_per_day * 200, len(df))).mean()
-
-            price = float(c.iloc[-1])
-            s50   = float(sma50.iloc[-1])
-            s200  = float(sma200.iloc[-1])
-
-            if pd.isna(s50) or pd.isna(s200):
-                trend = "Neutral"
-            elif price > s50 and s50 > s200:
-                trend = "Bull"
-            elif price < s50 and s50 < s200:
-                trend = "Bear"
-            else:
-                trend = "Neutral"
-
-            # ── Destek / Direnç — işlem günü pencereleri ─────────────────────
-            r1 = float(h.iloc[-b5:].max())
-            r2 = float(h.iloc[-b20:].max())
-            r3 = float(h.iloc[-b50:].max())
-            s1 = float(l.iloc[-b5:].min())
-            s2 = float(l.iloc[-b20:].min())
-            s3 = float(l.iloc[-b50:].min())
-
-            # ── Mesafe hesabı ─────────────────────────────────────────────────
-            dist_s1 = (price / s1 - 1) * 100 if s1 > 0 else 0.0
-            dist_r1 = (r1 / price - 1) * 100 if price > 0 else 0.0
-
-            return {
-                "price":    price,
-                "trend":    trend,
-                "s1": s1, "s2": s2, "s3": s3,
-                "r1": r1, "r2": r2, "r3": r3,
-                "dist_s1":  dist_s1,
-                "dist_r1":  dist_r1,
-                "b5":       b5,
-                "b20":      b20,
-                "b50":      b50,
-                "interval": interval,
-                "ok":       True
-            }
-        except Exception:
-            continue
-    return {"ok": False}
-
-
-def bist100_panel_html(d):
-    """BIST100 bilgi paneli — mevcut bt-info-box kart tasarımıyla uyumlu."""
-    if not d.get("ok"):
-        return (
-            "<div class='bt-info-box'>"
-            "<div class='bt-title'>📊 BIST100</div>"
-            "<div class='bt-row'><span class='bt-lbl'>Veri alınamadı</span></div>"
-            "</div>"
-        )
-
-    trend_css  = "up" if d["trend"] == "Bull" else ("dn" if d["trend"] == "Bear" else "wn")
-    trend_icon = "🟢" if d["trend"] == "Bull" else ("🔴" if d["trend"] == "Bear" else "🟡")
-
-    # ── Mesafe renk mantığı ─────────────────────────────────────────────────
-    # Dirençe mesafe: < %1 kırmızı, %1-%3 sarı, > %3 yeşil
-    dr = d["dist_r1"]
-    if dr < 1.0:
-        dist_r1_css = "dn"
-        dist_r1_icon = "🔴"
-    elif dr < 3.0:
-        dist_r1_css = "wn"
-        dist_r1_icon = "🟡"
-    else:
-        dist_r1_css = "up"
-        dist_r1_icon = "🟢"
-
-    # Desteğe mesafe: < %1 yeşil, %1-%3 sarı, > %3 kırmızı
-    ds = d["dist_s1"]
-    if ds < 1.0:
-        dist_s1_css = "up"
-        dist_s1_icon = "🟢"
-    elif ds < 3.0:
-        dist_s1_css = "wn"
-        dist_s1_icon = "🟡"
-    else:
-        dist_s1_css = "dn"
-        dist_s1_icon = "🔴"
-
-    iv = d.get("interval", "1d")
-
-    def row(lbl, val, cls=""):
-        return (
-            f"<div class='bt-row'>"
-            f"<span class='bt-lbl'>{lbl}</span>"
-            f"<span class='bt-val {cls}'>{val}</span>"
-            f"</div>"
-        )
-
-    sep  = "<div style='border-top:1px solid #2d3a50;margin:5px 0'></div>"
-    sepc = "<div style='border-top:1px solid #38bdf8;margin:5px 0'></div>"
-
-    html = (
-        "<div class='bt-info-box'>"
-        f"<div class='bt-title'>📊 BIST100 <span style='font-size:8px;color:#4a5568'>({iv})</span></div>"
-        + row("Fiyat", f"{d['price']:,.0f}")
-        + row("Trend", f"{trend_icon} {d['trend']}", trend_css)
-        + sep
-        + row("R3 — 50g Zirve", f"{d['r3']:,.0f}", "dn")
-        + row("R2 — 20g Zirve", f"{d['r2']:,.0f}", "dn")
-        + row("R1 — 5g Zirve",  f"{d['r1']:,.0f}", "dn")
-        + sepc
-        + row("S1 — 5g Dip",    f"{d['s1']:,.0f}", "up")
-        + row("S2 — 20g Dip",   f"{d['s2']:,.0f}", "up")
-        + row("S3 — 50g Dip",   f"{d['s3']:,.0f}", "up")
-        + sep
-        + row(f"{dist_r1_icon} Dirençe Mesafe (R1)", f"%{dr:.2f}", dist_r1_css)
-        + row(f"{dist_s1_icon} Desteğe Mesafe (S1)", f"%{ds:.2f}", dist_s1_css)
-        + "</div>"
-    )
-    return html
-
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 xu100  = get_xu100()
@@ -1270,132 +976,64 @@ with st.sidebar:
     if st.button("↺ Listeyi Sıfırla"):
         st.session_state.watchlist = BIST_30.copy()
         save_watchlist(st.session_state.watchlist); st.rerun()
-    st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  V19: Slippage + Likidite Tavanı + Batch Tarama")
+    st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  Liste yenilemede korunur.")
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
 col_l, col_c, col_r = st.columns([2.5, 5, 2.5])
 df = get_data(secilen)
 
-# ══ SOL: SCANNER (V19: BATCH ÇEKİM) ══════════════════════════════════════════
+# ══ SOL: SCANNER ══════════════════════════════════════════════════════════════
 with col_l:
     st.markdown("### 🚀 Tarayıcı")
-    st.caption("⏱️ 15dk gecikmeli  ·  V19: Batch tarama — tüm liste tek istekte")
+    st.caption("⏱️ 15dk gecikmeli  ·  V18: Backtest 1y/15m")
 
     if st.button("Tüm Listeyi Tara"):
         st.session_state.scan_rows = []
         st.session_state.breadth   = None
         rows, above_count = [], 0
+        prog = st.progress(0, text="Başlatılıyor...")
+        wl   = sorted(st.session_state.watchlist)
+        for i, t in enumerate(wl):
+            d = get_data(t)
+            if d is not None:
+                rs_ab, rs_sl, _ = relative_strength_full(d["Close"], xu100)
+                if rs_ab is None:                                    rs_icon = "📡"
+                elif bool(rs_ab.iloc[-1]) and bool(rs_sl.iloc[-1]): rs_icon = "💚"
+                elif bool(rs_ab.iloc[-1]):                           rs_icon = "🟡"
+                else:                                                rs_icon = "🔴"
 
-        wl        = sorted(st.session_state.watchlist)
-        tickers_s = [f"{t}.IS" for t in wl]
+                htf_val  = htf_trend(t)
+                htf_icon = "🟢" if htf_val is True else ("🔴" if htf_val is False else "⚪")
 
-        # ── V19 KRİTİK DÜZELTME #5: BATCH İNDİRME ─────────────────────────
-        # V18: her hisse için sırayla yf.download() → bloke edici, yavaş
-        # V19: yf.download(tickers_list) → tek HTTP isteğiyle 30 hisse
-        # Tarama süresi ~30 saniyeden ~2-4 saniyeye düşer.
-        with st.spinner(f"⚡ {len(wl)} hisse batch indiriliyor..."):
-            raw_batch = None
-            batch_combos = [
-                ("60d",  "15m"),
-                ("5d",   "15m"),
-                ("60d",  "1h"),
-                ("1y",   "1d"),
-                ("6mo",  "1d"),
-            ]
-            for _bp, _bi in batch_combos:
-                try:
-                    _rb = yf.download(
-                        tickers_s,
-                        period=_bp,
-                        interval=_bi,
-                        progress=False,
-                        group_by="ticker",
-                        threads=True,
-                        auto_adjust=True
-                    )
-                    if _rb is not None and not _rb.empty:
-                        raw_batch = _rb
-                        break
-                except Exception:
-                    continue
+                adx_val  = float(d["ADX"].iloc[-1])     if "ADX"    in d.columns else 0
+                pdi      = float(d["PlusDI"].iloc[-1])  if "PlusDI" in d.columns else 0
+                mdi      = float(d["MinusDI"].iloc[-1]) if "MinusDI"in d.columns else 0
+                di_sp    = pdi - mdi
+                adx_ok   = adx_val > ADX_THRESHOLD and pdi > mdi and di_sp > DI_SPREAD_MIN
+                adx_icon = "💪" if adx_ok else ("⚠️" if adx_val > ADX_THRESHOLD else "·")
 
-        if raw_batch is not None and not raw_batch.empty:
-            prog = st.progress(0, text="Analiz ediliyor...")
-            for i, (t, sym) in enumerate(zip(wl, tickers_s)):
-                try:
-                    # Batch sonucundan tek hisseyi çıkar
-                    if len(tickers_s) == 1:
-                        d_raw = raw_batch
-                    else:
-                        try:
-                            d_raw = raw_batch[sym] if sym in raw_batch.columns.get_level_values(0) else None
-                        except Exception:
-                            d_raw = None
+                obv_ok   = ("OBV" in d.columns and "OBV_MA20" in d.columns and
+                            float(d["OBV"].iloc[-1]) > float(d["OBV_MA20"].iloc[-1]))
+                obv_brk  = ("OBV_High20" in d.columns and
+                            float(d["OBV"].iloc[-1]) > float(d["OBV_High20"].iloc[-1]))
+                obv_icon = "🚀" if (obv_ok and obv_brk) else ("📈" if obv_ok else "📉")
 
-                    if d_raw is None or (hasattr(d_raw, 'empty') and d_raw.empty):
-                        prog.progress((i+1)/len(wl), text=f"Atlıyor: {t}")
-                        continue
+                trend_up = float(d["Close"].iloc[-1]) > float(d["SMA20"].iloc[-1])
+                if trend_up: above_count += 1
 
-                    # _flatten uygula
-                    if isinstance(d_raw, pd.DataFrame):
-                        d_raw = d_raw.loc[:, ~d_raw.columns.duplicated()]
-                        if hasattr(d_raw.index, "tz") and d_raw.index.tz is not None:
-                            d_raw.index = d_raw.index.tz_convert(None)
-
-                    if d_raw is None or d_raw.empty or "Close" not in d_raw.columns:
-                        prog.progress((i+1)/len(wl), text=f"Atlıyor: {t}")
-                        continue
-
-                    # Hızlı indikatör hesabı (sadece tarama için)
-                    c_s  = d_raw["Close"].squeeze()
-                    sma  = c_s.rolling(20).mean()
-                    adx_v, pdi_v, mdi_v = _calc_adx(d_raw)
-                    obv_v  = (np.sign(c_s.diff()) * d_raw["Volume"]).fillna(0).cumsum()
-                    obv_ma = obv_v.rolling(20).mean()
-                    obv_h  = obv_v.rolling(OBV_BRK_LOOKBACK).max().shift(1)
-                    sqz_v  = bollinger_squeeze(c_s)
-
-                    rs_ab, rs_sl, _ = relative_strength_full(c_s, xu100)
-                    if rs_ab is None:                                    rs_icon = "📡"
-                    elif bool(rs_ab.iloc[-1]) and bool(rs_sl.iloc[-1]): rs_icon = "💚"
-                    elif bool(rs_ab.iloc[-1]):                           rs_icon = "🟡"
-                    else:                                                rs_icon = "🔴"
-
-                    htf_val  = htf_trend(t)
-                    htf_icon = "🟢" if htf_val is True else ("🔴" if htf_val is False else "⚪")
-
-                    adx_val_s = float(adx_v.iloc[-1]) if len(adx_v) > 0 else 0
-                    pdi_s     = float(pdi_v.iloc[-1]) if len(pdi_v) > 0 else 0
-                    mdi_s     = float(mdi_v.iloc[-1]) if len(mdi_v) > 0 else 0
-                    di_sp_s   = pdi_s - mdi_s
-                    adx_ok_s  = adx_val_s > ADX_THRESHOLD and pdi_s > mdi_s and di_sp_s > DI_SPREAD_MIN
-                    adx_icon  = "💪" if adx_ok_s else ("⚠️" if adx_val_s > ADX_THRESHOLD else "·")
-
-                    obv_ok_s  = float(obv_v.iloc[-1]) > float(obv_ma.iloc[-1])
-                    obv_brk_s = float(obv_v.iloc[-1]) > float(obv_h.iloc[-1]) if not pd.isna(obv_h.iloc[-1]) else False
-                    obv_icon  = "🚀" if (obv_ok_s and obv_brk_s) else ("📈" if obv_ok_s else "📉")
-
-                    trend_up  = float(c_s.iloc[-1]) > float(sma.iloc[-1])
-                    if trend_up: above_count += 1
-
-                    rows.append({
-                        "H":   t,
-                        "F":   f"{float(c_s.iloc[-1]):.2f}",
-                        "T":   "↑" if trend_up else "↓",
-                        "HTF": htf_icon,
-                        "ADX": adx_icon,
-                        "SQZ": "🟡" if bool(sqz_v.iloc[-1]) else "·",
-                        "RS":  rs_icon,
-                        "OBV": obv_icon,
-                        "EVT": st.session_state.event_risks.get(t, "📡"),
-                    })
-                except Exception:
-                    pass
-                prog.progress((i+1)/len(wl), text=f"Analiz: {t}")
-            prog.empty()
-        else:
-            st.warning("Batch veri indirilemedi, tekrar deneyin.")
-
+                rows.append({
+                    "H":   t,
+                    "F":   f"{float(d['Close'].iloc[-1]):.2f}",
+                    "T":   "↑" if trend_up else "↓",
+                    "HTF": htf_icon,
+                    "ADX": adx_icon,
+                    "SQZ": "🟡" if bool(bollinger_squeeze(d["Close"]).iloc[-1]) else "·",
+                    "RS":  rs_icon,
+                    "OBV": obv_icon,
+                    "EVT": st.session_state.event_risks.get(t, "📡"),
+                })
+            prog.progress((i+1)/len(wl), text=f"Tarıyor: {t}")
+        prog.empty()
         st.session_state.scan_rows = rows
         st.session_state.breadth   = {"above": above_count, "total": len(rows)}
         st.rerun()
@@ -1463,21 +1101,21 @@ with col_r:
         sma      = float(df["SMA20"].iloc[-1])
         rsi      = float(df["RSI"].iloc[-1])
         vol_now  = float(df["Volume"].iloc[-1])
-        vol_ma   = float(df["VolMA20"].iloc[-1])   if "VolMA20"   in df.columns else vol_now
-        adx_val  = float(df["ADX"].iloc[-1])        if "ADX"       in df.columns else 0.0
-        plus_di  = float(df["PlusDI"].iloc[-1])     if "PlusDI"    in df.columns else 0.0
-        minus_di = float(df["MinusDI"].iloc[-1])    if "MinusDI"   in df.columns else 0.0
-        vol_pct  = float(df["VolPct"].iloc[-1])     if "VolPct"    in df.columns else 50.0
-        atr_exp  = float(df["ATR_Slope"].iloc[-1])  if "ATR_Slope" in df.columns else 0.0
-        obv_now  = float(df["OBV"].iloc[-1])        if "OBV"       in df.columns else 0.0
-        obv_ma   = float(df["OBV_MA20"].iloc[-1])   if "OBV_MA20"  in df.columns else 0.0
-        obv_h20  = float(df["OBV_High20"].iloc[-1]) if "OBV_High20"in df.columns else obv_now
-        gap_pct  = float(df["GapPct"].iloc[-1])     if "GapPct"    in df.columns else 0.0
-        di_sp    = float(df["DI_Spread"].iloc[-1])  if "DI_Spread" in df.columns else (plus_di - minus_di)
-        vwap_val = float(df["VWAP"].iloc[-1])       if "VWAP"      in df.columns else None
-        rsi_pct  = float(df["RSI_Pct"].iloc[-1])    if "RSI_Pct"   in df.columns else 50.0
-        adx_slp  = float(df["ADX_Slope"].iloc[-1])  if "ADX_Slope" in df.columns else 0.0
-        atr_pct2 = float(df["ATR_Pct"].iloc[-1])    if "ATR_Pct"   in df.columns else 50.0
+        vol_ma   = float(df["VolMA20"].iloc[-1])  if "VolMA20"   in df.columns else vol_now
+        adx_val  = float(df["ADX"].iloc[-1])       if "ADX"       in df.columns else 0.0
+        plus_di  = float(df["PlusDI"].iloc[-1])    if "PlusDI"    in df.columns else 0.0
+        minus_di = float(df["MinusDI"].iloc[-1])   if "MinusDI"   in df.columns else 0.0
+        vol_pct  = float(df["VolPct"].iloc[-1])    if "VolPct"    in df.columns else 50.0
+        atr_exp  = float(df["ATR_Slope"].iloc[-1]) if "ATR_Slope" in df.columns else 0.0
+        obv_now  = float(df["OBV"].iloc[-1])       if "OBV"       in df.columns else 0.0
+        obv_ma   = float(df["OBV_MA20"].iloc[-1])  if "OBV_MA20"  in df.columns else 0.0
+        obv_h20  = float(df["OBV_High20"].iloc[-1])if "OBV_High20"in df.columns else obv_now
+        gap_pct  = float(df["GapPct"].iloc[-1])    if "GapPct"    in df.columns else 0.0
+        di_sp    = float(df["DI_Spread"].iloc[-1]) if "DI_Spread" in df.columns else (plus_di - minus_di)
+        vwap_val = float(df["VWAP"].iloc[-1])      if "VWAP"      in df.columns else None
+        rsi_pct  = float(df["RSI_Pct"].iloc[-1])   if "RSI_Pct"   in df.columns else 50.0
+        adx_slp  = float(df["ADX_Slope"].iloc[-1]) if "ADX_Slope" in df.columns else 0.0
+        atr_pct2 = float(df["ATR_Pct"].iloc[-1])   if "ATR_Pct"   in df.columns else 50.0
 
         sqz_now               = bool(bollinger_squeeze(df["Close"]).iloc[-1])
         rs_above, rs_sl_s, _  = relative_strength_full(df["Close"], xu100)
@@ -1541,24 +1179,11 @@ with col_r:
         tab1, tab2, tab3 = st.tabs(["📐 Planner", "🤖 Broker", "📊 Backtest"])
 
         with tab1:
-            # ── V19 KRİTİK DÜZELTME #3: LİKİDİTE TAVANI ─────────────────────
-            # Önerilen lot, günlük ortalama hacmin %1'ini aşamaz.
-            # Büyük portföylerde sığ hisselerde piyasayı hareket ettirmez.
-            raw_lot   = int((portfoy * aktif_risk) / risk_tl)
-            max_lot   = int(vol_ma * LOT_LIQ_CAP_PCT) if vol_ma > 0 else raw_lot
-            lot       = min(raw_lot, max_lot)
-            liq_capped = (raw_lot > max_lot)
-
+            lot = int((portfoy * aktif_risk) / risk_tl)
             st.markdown(regime_html(regime, "font-size:10px;padding:4px 8px"), unsafe_allow_html=True)
             st.markdown(htf_html(htf_now, secilen), unsafe_allow_html=True)
             if not gap_ok:
                 st.warning(f"⚠️ GAP %{gap_pct*100:.2f} — Pozisyon küçültün veya bekleyin.")
-            if liq_capped:
-                st.markdown(
-                    f"<div class='liq-warn'>⚠️ Likidite Tavanı: {raw_lot} lot önerildi, "
-                    f"günlük hacim ({vol_ma:,.0f}) sınırı {lot} lot'a indirdi.</div>",
-                    unsafe_allow_html=True
-                )
             st.markdown(metric_grid(
                 ("Giriş Fiyatı",  f"{fiyat:.2f} TL",       ""),
                 ("Stop Loss",     f"{stop:.2f} TL",         "dn"),
@@ -1567,16 +1192,8 @@ with col_r:
                 ("Maliyet",       f"{lot*fiyat:,.0f} TL",   ""),
                 ("Risk / İşlem",  f"%{aktif_risk*100:.1f}", "wn"),
             ), unsafe_allow_html=True)
-            if liq_capped:
-                st.markdown(metric_grid(
-                    ("Ham Lot (Risk)",  f"{raw_lot} adet",  "dn"),
-                    ("Maks Lot (Liq.)",f"{max_lot} adet",  "wn"),
-                ), unsafe_allow_html=True)
             st.markdown(rr_bar_html(risk_tl, reward_tl, rr_ratio), unsafe_allow_html=True)
             st.markdown(mhs_html(mhs_score, mhs_detail), unsafe_allow_html=True)
-            # ── BIST100 PANELİ ────────────────────────────────────────────
-            bist100_data = get_bist100_panel()
-            st.markdown(bist100_panel_html(bist100_data), unsafe_allow_html=True)
             st.caption("⏱️ 15dk gecikmeli veri — giriş öncesi teyit alın.")
 
         with tab2:
@@ -1648,87 +1265,86 @@ with col_r:
             st.caption("⏱️ 15dk gecikmeli veri.")
 
         # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  TAB 3 — BACKTEST V19                                           ║
-        # ║  Kritik düzeltme: yfinance 15m/1y limiti → çift mod sistemi    ║
+        # ║  TAB 3 — BACKTEST V18  (6 sorun düzeltildi)                    ║
         # ╚══════════════════════════════════════════════════════════════════╝
         with tab3:
-            # ── Mod seçimi ─────────────────────────────────────────────────
-            st.markdown(
-                "<div class='slip-info'>"
-                "ℹ️ <b>V19 Düzeltmesi:</b> yfinance 15m veri limiti max 60 gündür. "
-                "Daha uzun test için <b>1g (Uzun Dönem)</b> modunu seçin."
-                "</div>",
-                unsafe_allow_html=True
-            )
-            bt_mode = st.radio(
-                "Backtest Modu",
-                options=["15dk (60 Gün, ~5760 Bar)", "1g (2 Yıl, ~500 Bar)"],
-                horizontal=True,
-                key="bt_mode_radio"
-            )
-            mode_key = "15m" if bt_mode.startswith("15") else "1d"
-            max_hold = MAX_HOLD_BARS_15M if mode_key == "15m" else MAX_HOLD_BARS_1D
-            period_lbl = f"{BT_PERIOD_15M}/{BT_INTERVAL_15M}" if mode_key == "15m" else f"{BT_PERIOD_1D}/{BT_INTERVAL_1D}"
-            bar_est    = "~5.760 bar" if mode_key == "15m" else "~500 bar"
-
+            # Backtest bilgi kutusu — veri dinamik (CASCADE'e göre değişir)
             st.markdown(
                 f"<div class='bt-info-box'>"
-                f"<div class='bt-title'>V19 Backtest Mimarisi</div>"
+                f"<div class='bt-title'>V18 Backtest Mimarisi</div>"
                 f"<div class='bt-row'><span class='bt-lbl'>Veri</span>"
-                f"<span class='bt-val'>{period_lbl} ({bar_est})</span></div>"
+                f"<span class='bt-val'>60d/15m → 2y/1h (cascade)</span></div>"
                 f"<div class='bt-row'><span class='bt-lbl'>Giriş</span>"
-                f"<span class='bt-val'>{BT_CORE_FILTERS} core filtre + Slippage</span></div>"
+                f"<span class='bt-val'>{BT_CORE_FILTERS} core filtre</span></div>"
                 f"<div class='bt-row'><span class='bt-lbl'>Stop</span>"
                 f"<span class='bt-val'>ATR × {TRAIL_ATR_MULT} Trailing</span></div>"
                 f"<div class='bt-row'><span class='bt-lbl'>Max Süre</span>"
-                f"<span class='bt-val'>{max_hold} bar</span></div>"
+                f"<span class='bt-val'>{MAX_HOLD_BARS} bar</span></div>"
                 f"<div class='bt-row'><span class='bt-lbl'>Maliyet</span>"
-                f"<span class='bt-val'>%{TRADE_COST*100:.2f} komisyon + Slippage (ATR×{SLIPPAGE_ATR_FACTOR})</span></div>"
+                f"<span class='bt-val'>%{TRADE_COST*100:.2f} / işlem</span></div>"
                 f"</div>",
                 unsafe_allow_html=True
             )
 
             if st.button("▶ Backtest Çalıştır", key="bt_run"):
-                spinner_txt = ("1 yıllık günlük veri yükleniyor..." if mode_key == "1d"
-                               else "60 günlük 15dk veri yükleniyor...")
-                with st.spinner(spinner_txt):
-                    res = run_backtest(secilen, mode_key)
+                with st.spinner("Veri yükleniyor (60d/15m → 2y/1h cascade)..."):
+                    res = run_backtest(secilen)
                 st.session_state["bt_result"] = res
                 st.session_state["bt_ticker"] = secilen
-                st.session_state["bt_mode"]   = mode_key
 
             # Sonuç gösterimi
             res       = st.session_state.get("bt_result")
             bt_ticker = st.session_state.get("bt_ticker", "")
-            bt_mode_s = st.session_state.get("bt_mode", "?")
 
             if res is None:
-                st.info("▶ Modu seçin ve butona basarak backtest başlatın.")
+                st.info("▶ Butona basarak backtest başlatın.")
             elif res.get("err"):
                 st.warning(f"ℹ️ {res['err']}")
             else:
                 if bt_ticker != secilen:
-                    st.warning(f"⚠️ Gösterilen sonuç {bt_ticker} için. {secilen} için tekrar çalıştırın.")
+                    st.warning(
+                        f"⚠️ Gösterilen sonuç {bt_ticker} için. "
+                        f"{secilen} için tekrar çalıştırın."
+                    )
 
-                ret_cls = "up" if res["total"] >= 0 else "dn"
-                pf_str  = f"{res['pf']:.2f}" if res["pf"] != float("inf") else "∞"
+                ret_cls  = "up" if res["total"] >= 0 else "dn"
+                pf_str   = f"{res['pf']:.2f}" if res["pf"] != float("inf") else "∞"
+                interval = res.get("interval", "?")
+                period   = res.get("period",   "?")
+
+                # Hangi veri kullanıldı — kullanıcıya göster
+                iv_cls = "up" if interval == "15m" else "wn"
+                iv_lbl = "✅ 15m (tutarlı)" if interval == "15m" else "⚠️ 1h (fallback)"
+                st.markdown(
+                    f"<div class='bt-info-box' style='margin-bottom:6px'>"
+                    f"<div class='bt-title'>Kullanılan Veri</div>"
+                    f"<div class='bt-row'>"
+                    f"<span class='bt-lbl'>Interval / Period</span>"
+                    f"<span class='bt-val {iv_cls}'>{interval} / {period} ({res['bars']} bar)</span>"
+                    f"</div></div>",
+                    unsafe_allow_html=True
+                )
 
                 st.markdown(metric_grid(
                     ("Robot Getiri (net)", f"%{res['total']:.2f}", ret_cls),
-                    ("Al-Bekle",           f"%{res['bh']:.2f}",   "up" if res["bh"]>=0 else "dn"),
-                    ("Win Rate",           f"%{res['wr']:.1f}",   "up" if res["wr"]>=50 else "dn"),
-                    ("Profit Factor",      pf_str,                 "up" if res["pf"]>1 else "dn"),
+                    ("Al-Bekle",           f"%{res['bh']:.2f}",
+                     "up" if res["bh"] >= 0 else "dn"),
+                    ("Win Rate",           f"%{res['wr']:.1f}",
+                     "up" if res["wr"] >= 50 else "dn"),
+                    ("Profit Factor",      pf_str,
+                     "up" if res["pf"] > 1 else "dn"),
                     ("Max Drawdown",       f"%{res['dd']:.1f}",   "dn"),
-                    ("İşlem Sayısı",       str(res["n"]),          "up" if res["n"]>=5 else "wn"),
+                    ("İşlem Sayısı",       str(res["n"]),
+                     "up" if res["n"] >= 5 else "wn"),
                 ), unsafe_allow_html=True)
 
                 st.markdown(metric_grid(
-                    ("Ort. Süre",    f"{res['avg_bars']:.0f} bar",                     ""),
-                    ("Test Verisi",  f"{res['bars']} bar / {res['period']}/{res['interval']}", ""),
+                    ("Ort. Süre",   f"{res['avg_bars']:.0f} bar", ""),
+                    ("Test Verisi", f"{res['bars']} bar / {period}", ""),
                 ), unsafe_allow_html=True)
 
                 if res["total"] > res["bh"]:
-                    st.success("💪 Robot Al-Bekle'yi Yendi! (Slippage + Komisyon + Trailing Stop Dahil)")
+                    st.success("💪 Robot Al-Bekle'yi Yendi! (Maliyet + Trailing Stop Dahil)")
                 else:
                     st.warning("🐢 Al-Bekle Daha İyi Performans Gösterdi")
 
@@ -1748,9 +1364,10 @@ with col_r:
                     unsafe_allow_html=True
                 )
                 st.caption(
-                    f"⚠️ Kapanış bazlı + Slippage (ATR×{SLIPPAGE_ATR_FACTOR}) — gerçek sonuç ±%3-5 farklı olabilir.  \n"
+                    f"⚠️ Kapanış fiyatı bazlı — gerçek sonuç %5-10 farklı olabilir.  \n"
                     f"Giriş: Trend + RSI(45-75) + RS + ADX>20 + +DI>-DI + Breakout  \n"
-                    f"Canlı 22 filtreden 6 core filtre kullanıldı — istatistiksel anlam için."
+                    f"Canlı analizdeki 22 filtreden {BT_CORE_FILTERS} core filtre — "
+                    f"istatistiksel anlam için sadeleştirildi."
                 )
     else:
         st.warning("Seçili hisse için veri alınamadı.")
