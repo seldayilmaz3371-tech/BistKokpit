@@ -306,17 +306,37 @@ def _vol_pct_vectorized(volume: pd.Series, lookback: int = VOL_PCT_LOOKBACK) -> 
 
 @st.cache_data(ttl=900)
 def get_xu100():
-    for sym in ("XU100.IS", "^XU100"):
+    # Fallback zinciri: en güvenilir olan gunluk veriden basla
+    combos = [
+        ("XU100.IS",  "1y",  "1d"),
+        ("^XU100",    "1y",  "1d"),
+        ("XU100.IS",  "6mo", "1d"),
+        ("^XU100",    "6mo", "1d"),
+        ("XU100.IS",  "60d", "1h"),
+        ("^XU100",    "60d", "1h"),
+        ("XU100.IS",  "5d",  "15m"),
+        ("^XU100",    "5d",  "15m"),
+    ]
+    for sym, period, interval in combos:
         try:
-            df = _flatten(yf.download(sym, period="60d", interval="15m", progress=False))
-            if df is not None:
-                df["SMA50"]   = df["Close"].rolling(REGIME_SMA).mean()
-                df["RSI"]     = _calc_rsi(df["Close"])
-                adx, pdi, mdi = _calc_adx(df)
-                df["ADX"]     = adx
-                df["PlusDI"]  = pdi
-                df["MinusDI"] = mdi
-                return df
+            df = _flatten(yf.download(sym, period=period, interval=interval,
+                                      progress=False, auto_adjust=True))
+            if df is None or df.empty or len(df) < 10:
+                continue
+            if interval == "1h":
+                df = df.resample("4h").agg(
+                    {"Open": "first", "High": "max",
+                     "Low": "min", "Close": "last", "Volume": "sum"}
+                ).dropna()
+            if len(df) < 5:
+                continue
+            df["SMA50"]   = df["Close"].rolling(min(REGIME_SMA, len(df))).mean()
+            df["RSI"]     = _calc_rsi(df["Close"])
+            adx, pdi, mdi = _calc_adx(df)
+            df["ADX"]     = adx
+            df["PlusDI"]  = pdi
+            df["MinusDI"] = mdi
+            return df
         except Exception:
             continue
     return None
@@ -345,9 +365,26 @@ def get_4h(ticker):
 
 @st.cache_data(ttl=300)
 def get_data(ticker):
-    """Canlı analiz için 60d/15m veri."""
+    """Canlı analiz için veri — fallback zinciri ile güvenilir çekim."""
+    sym = f"{ticker}.IS"
+    combos = [
+        (sym, "60d",  "15m"),
+        (sym, "5d",   "15m"),
+        (sym, "60d",  "1h"),
+        (sym, "1y",   "1d"),
+        (sym, "6mo",  "1d"),
+    ]
+    df = None
+    for _sym, _period, _interval in combos:
+        try:
+            _df = _flatten(yf.download(_sym, period=_period, interval=_interval,
+                                       progress=False, auto_adjust=True))
+            if _df is not None and not _df.empty and len(_df) >= 30:
+                df = _df
+                break
+        except Exception:
+            continue
     try:
-        df = _flatten(yf.download(f"{ticker}.IS", period="60d", interval="15m", progress=False))
         if df is None: return None
         c, h, l = df["Close"], df["High"], df["Low"]
 
@@ -425,8 +462,23 @@ def get_backtest_data(ticker: str, mode: str = "15m"):
     interval = BT_INTERVAL_15M if mode == "15m" else BT_INTERVAL_1D
     min_bars = 100              if mode == "15m" else 60
 
+    # Fallback: istenen period/interval yoksa alternatifler dene
+    fallback_combos = [(period, interval)]
+    if mode == "15m":
+        fallback_combos += [("5d","15m"), ("60d","1h"), ("1y","1d")]
+    else:
+        fallback_combos += [("1y","1d"), ("6mo","1d")]
+    df = None
+    for _p, _i in fallback_combos:
+        try:
+            _df = _flatten(yf.download(sym, period=_p, interval=_i,
+                                       progress=False, auto_adjust=True))
+            if _df is not None and not _df.empty and len(_df) >= min_bars:
+                df = _df
+                break
+        except Exception:
+            continue
     try:
-        df = _flatten(yf.download(sym, period=period, interval=interval, progress=False))
         if df is None or len(df) < min_bars:
             return None
         c, h, l = df["Close"], df["High"], df["Low"]
@@ -453,16 +505,22 @@ def get_backtest_data(ticker: str, mode: str = "15m"):
 
 @st.cache_data(ttl=1800)
 def get_backtest_xu100(mode: str = "15m"):
-    """Backtest için XU100 — moda göre."""
-    period   = BT_PERIOD_15M   if mode == "15m" else BT_PERIOD_1D
-    interval = BT_INTERVAL_15M if mode == "15m" else BT_INTERVAL_1D
-    for sym in ("XU100.IS", "^XU100"):
-        try:
-            df = _flatten(yf.download(sym, period=period, interval=interval, progress=False))
-            if df is not None and len(df) > 50:
-                return df[["Close"]].copy()
-        except Exception:
-            continue
+    """Backtest için XU100 — moda gore, fallback zinciriyle."""
+    if mode == "15m":
+        combos_sym   = ["XU100.IS", "^XU100"]
+        combos_pd_iv = [("60d","15m"),("5d","15m"),("60d","1h"),("1y","1d")]
+    else:
+        combos_sym   = ["XU100.IS", "^XU100"]
+        combos_pd_iv = [("2y","1d"),("1y","1d"),("6mo","1d")]
+    for sym in combos_sym:
+        for period, interval in combos_pd_iv:
+            try:
+                df = _flatten(yf.download(sym, period=period, interval=interval,
+                                          progress=False, auto_adjust=True))
+                if df is not None and not df.empty and len(df) > 20:
+                    return df[["Close"]].copy()
+            except Exception:
+                continue
     return None
 
 def run_backtest(ticker: str, mode: str = "15m"):
@@ -635,10 +693,22 @@ def bollinger_squeeze(close):
 
 @st.cache_data(ttl=900)
 def get_sektor_data(sektor_sym):
-    try:
-        return _flatten(yf.download(sektor_sym, period="60d", interval="15m", progress=False))
-    except Exception:
-        return None
+    combos = [
+        ("60d", "15m"),
+        ("5d",  "15m"),
+        ("60d", "1h"),
+        ("1y",  "1d"),
+        ("6mo", "1d"),
+    ]
+    for period, interval in combos:
+        try:
+            df = _flatten(yf.download(sektor_sym, period=period, interval=interval,
+                                      progress=False, auto_adjust=True))
+            if df is not None and not df.empty and len(df) >= 10:
+                return df
+        except Exception:
+            continue
+    return None
 
 def sektor_rs(stock_close, ticker, xu100_df):
     sektor_sym   = SEKTOR_MAP.get(ticker.upper())
@@ -953,6 +1023,202 @@ def vol_bar_html(vol_now, vol_ma, vol_ratio, vol_confirmed, vol_pct):
             f"<span>RVOL: x{vol_ratio:.2f}</span>"
             f"<span>P{vol_pct:.0f}</span></div></div>")
 
+# ── BIST100 PANELİ FONKSİYONU ────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def get_bist100_panel():
+    """
+    BIST100 (XU100.IS / ^XU100) için Planner paneli verisi.
+
+    Destek/Direnç — işlem günü bazlı pencere:
+        R1/S1 = son 5  işlem günü High/Low  (bu hafta)
+        R2/S2 = son 20 işlem günü High/Low  (son ay)
+        R3/S3 = son 50 işlem günü High/Low  (son çeyrek)
+
+    Veri frekansı ne olursa olsun günlük bar sayısına indirgeme yapılır:
+        - 1d  verisi: 1 bar  = 1 gün  → pencereler doğrudan kullanılır
+        - 1h  verisi: 1 gün ≈ 8 bar   → pencere × 8
+        - 15m verisi: 1 gün ≈ 26 bar  → pencere × 26
+    Bar sayısı veri uzunluğundan otomatik tahmin edilir.
+
+    Trend: Close > SMA50 > SMA200 → Bull
+           Close < SMA50 < SMA200 → Bear
+           Aksi                   → Neutral
+    """
+    # Fallback: önce günlük veri (en güvenilir + yeterli bar sayısı için gerekli)
+    combos = [
+        ("XU100.IS", "1y",  "1d"),
+        ("^XU100",   "1y",  "1d"),
+        ("XU100.IS", "6mo", "1d"),
+        ("^XU100",   "6mo", "1d"),
+        ("XU100.IS", "60d", "1h"),
+        ("^XU100",   "60d", "1h"),
+        ("XU100.IS", "5d",  "15m"),
+        ("^XU100",   "5d",  "15m"),
+    ]
+    for sym, period, interval in combos:
+        try:
+            df = _flatten(yf.download(sym, period=period, interval=interval,
+                                      progress=False, auto_adjust=True))
+            if df is None or df.empty or len(df) < 10:
+                continue
+
+            # ── Bar-başına-gün katsayısını veri aralığından hesapla ──────────
+            # Varsayım yapmak yerine gerçek veri frekansını ölç.
+            # İlk 50 bar'ın zaman aralığından medyan bar süresini bul.
+            idx = df.index
+            if len(idx) >= 2:
+                deltas = pd.Series(idx).diff().dropna()
+                # Çok kısa (sıfır) ve çok uzun (hafta sonu boşluğu) değerleri at
+                deltas = deltas[deltas > pd.Timedelta(0)]
+                # Medyan bar süresi (dakika)
+                median_minutes = deltas.median().total_seconds() / 60
+            else:
+                median_minutes = 1440  # fallback: günlük
+
+            # 1 işlem günü = 510 dakika (BIST: 09:30–18:00 = 8.5 saat)
+            # Günlük veri → ~1440 dk; ama günlük barda 1 bar = 1 gün doğrudan
+            if median_minutes >= 240:       # 4h veya günlük → 1 bar ≈ 1 gün
+                bars_per_day = 1
+            elif median_minutes >= 55:      # 1h → 1 gün ≈ 8 bar (09:30–17:30)
+                bars_per_day = 8
+            else:                           # 15m → 1 gün ≈ 26 bar (09:30–18:00)
+                bars_per_day = 26
+
+            b5  = max(bars_per_day * 5,  10)
+            b20 = max(bars_per_day * 20, b5  + 1)
+            b50 = max(bars_per_day * 50, b20 + 1)
+
+            # Yeterli veri yoksa bu kombinasyonu atla
+            if len(df) < b5:
+                continue
+
+            # Mevcut bar sayısına sığacak şekilde kırp
+            b20 = min(b20, len(df))
+            b50 = min(b50, len(df))
+
+            c = df["Close"]
+            h = df["High"]
+            l = df["Low"]
+
+            # ── Trend (SMA200 için günlük veri zorunlu; günlük değilse yaklaşık) ──
+            sma50  = c.rolling(min(bars_per_day * 50,  len(df))).mean()
+            sma200 = c.rolling(min(bars_per_day * 200, len(df))).mean()
+
+            price = float(c.iloc[-1])
+            s50   = float(sma50.iloc[-1])
+            s200  = float(sma200.iloc[-1])
+
+            if pd.isna(s50) or pd.isna(s200):
+                trend = "Neutral"
+            elif price > s50 and s50 > s200:
+                trend = "Bull"
+            elif price < s50 and s50 < s200:
+                trend = "Bear"
+            else:
+                trend = "Neutral"
+
+            # ── Destek / Direnç — işlem günü pencereleri ─────────────────────
+            r1 = float(h.iloc[-b5:].max())
+            r2 = float(h.iloc[-b20:].max())
+            r3 = float(h.iloc[-b50:].max())
+            s1 = float(l.iloc[-b5:].min())
+            s2 = float(l.iloc[-b20:].min())
+            s3 = float(l.iloc[-b50:].min())
+
+            # ── Mesafe hesabı ─────────────────────────────────────────────────
+            dist_s1 = (price / s1 - 1) * 100 if s1 > 0 else 0.0
+            dist_r1 = (r1 / price - 1) * 100 if price > 0 else 0.0
+
+            return {
+                "price":    price,
+                "trend":    trend,
+                "s1": s1, "s2": s2, "s3": s3,
+                "r1": r1, "r2": r2, "r3": r3,
+                "dist_s1":  dist_s1,
+                "dist_r1":  dist_r1,
+                "b5":       b5,
+                "b20":      b20,
+                "b50":      b50,
+                "interval": interval,
+                "ok":       True
+            }
+        except Exception:
+            continue
+    return {"ok": False}
+
+
+def bist100_panel_html(d):
+    """BIST100 bilgi paneli — mevcut bt-info-box kart tasarımıyla uyumlu."""
+    if not d.get("ok"):
+        return (
+            "<div class='bt-info-box'>"
+            "<div class='bt-title'>📊 BIST100</div>"
+            "<div class='bt-row'><span class='bt-lbl'>Veri alınamadı</span></div>"
+            "</div>"
+        )
+
+    trend_css  = "up" if d["trend"] == "Bull" else ("dn" if d["trend"] == "Bear" else "wn")
+    trend_icon = "🟢" if d["trend"] == "Bull" else ("🔴" if d["trend"] == "Bear" else "🟡")
+
+    # ── Mesafe renk mantığı ─────────────────────────────────────────────────
+    # Dirençe mesafe: < %1 kırmızı, %1-%3 sarı, > %3 yeşil
+    dr = d["dist_r1"]
+    if dr < 1.0:
+        dist_r1_css = "dn"
+        dist_r1_icon = "🔴"
+    elif dr < 3.0:
+        dist_r1_css = "wn"
+        dist_r1_icon = "🟡"
+    else:
+        dist_r1_css = "up"
+        dist_r1_icon = "🟢"
+
+    # Desteğe mesafe: < %1 yeşil, %1-%3 sarı, > %3 kırmızı
+    ds = d["dist_s1"]
+    if ds < 1.0:
+        dist_s1_css = "up"
+        dist_s1_icon = "🟢"
+    elif ds < 3.0:
+        dist_s1_css = "wn"
+        dist_s1_icon = "🟡"
+    else:
+        dist_s1_css = "dn"
+        dist_s1_icon = "🔴"
+
+    iv = d.get("interval", "1d")
+
+    def row(lbl, val, cls=""):
+        return (
+            f"<div class='bt-row'>"
+            f"<span class='bt-lbl'>{lbl}</span>"
+            f"<span class='bt-val {cls}'>{val}</span>"
+            f"</div>"
+        )
+
+    sep  = "<div style='border-top:1px solid #2d3a50;margin:5px 0'></div>"
+    sepc = "<div style='border-top:1px solid #38bdf8;margin:5px 0'></div>"
+
+    html = (
+        "<div class='bt-info-box'>"
+        f"<div class='bt-title'>📊 BIST100 <span style='font-size:8px;color:#4a5568'>({iv})</span></div>"
+        + row("Fiyat", f"{d['price']:,.0f}")
+        + row("Trend", f"{trend_icon} {d['trend']}", trend_css)
+        + sep
+        + row("R3 — 50g Zirve", f"{d['r3']:,.0f}", "dn")
+        + row("R2 — 20g Zirve", f"{d['r2']:,.0f}", "dn")
+        + row("R1 — 5g Zirve",  f"{d['r1']:,.0f}", "dn")
+        + sepc
+        + row("S1 — 5g Dip",    f"{d['s1']:,.0f}", "up")
+        + row("S2 — 20g Dip",   f"{d['s2']:,.0f}", "up")
+        + row("S3 — 50g Dip",   f"{d['s3']:,.0f}", "up")
+        + sep
+        + row(f"{dist_r1_icon} Dirençe Mesafe (R1)", f"%{dr:.2f}", dist_r1_css)
+        + row(f"{dist_s1_icon} Desteğe Mesafe (S1)", f"%{ds:.2f}", dist_s1_css)
+        + "</div>"
+    )
+    return html
+
+
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 xu100  = get_xu100()
 
@@ -1028,17 +1294,30 @@ with col_l:
         # V19: yf.download(tickers_list) → tek HTTP isteğiyle 30 hisse
         # Tarama süresi ~30 saniyeden ~2-4 saniyeye düşer.
         with st.spinner(f"⚡ {len(wl)} hisse batch indiriliyor..."):
-            try:
-                raw_batch = yf.download(
-                    tickers_s,
-                    period="60d",
-                    interval="15m",
-                    progress=False,
-                    group_by="ticker",
-                    threads=True
-                )
-            except Exception:
-                raw_batch = None
+            raw_batch = None
+            batch_combos = [
+                ("60d",  "15m"),
+                ("5d",   "15m"),
+                ("60d",  "1h"),
+                ("1y",   "1d"),
+                ("6mo",  "1d"),
+            ]
+            for _bp, _bi in batch_combos:
+                try:
+                    _rb = yf.download(
+                        tickers_s,
+                        period=_bp,
+                        interval=_bi,
+                        progress=False,
+                        group_by="ticker",
+                        threads=True,
+                        auto_adjust=True
+                    )
+                    if _rb is not None and not _rb.empty:
+                        raw_batch = _rb
+                        break
+                except Exception:
+                    continue
 
         if raw_batch is not None and not raw_batch.empty:
             prog = st.progress(0, text="Analiz ediliyor...")
@@ -1295,6 +1574,9 @@ with col_r:
                 ), unsafe_allow_html=True)
             st.markdown(rr_bar_html(risk_tl, reward_tl, rr_ratio), unsafe_allow_html=True)
             st.markdown(mhs_html(mhs_score, mhs_detail), unsafe_allow_html=True)
+            # ── BIST100 PANELİ ────────────────────────────────────────────
+            bist100_data = get_bist100_panel()
+            st.markdown(bist100_panel_html(bist100_data), unsafe_allow_html=True)
             st.caption("⏱️ 15dk gecikmeli veri — giriş öncesi teyit alın.")
 
         with tab2:
