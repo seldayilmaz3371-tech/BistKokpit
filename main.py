@@ -53,7 +53,7 @@ if "breadth"     not in st.session_state: st.session_state.breadth     = None
 st.markdown("""
 <style>
 section.main > div { padding-top: 0.35rem !important; }
-.scanner-wrapper { max-height: 390px; overflow-y: auto; overflow-x: hidden; border: 1px solid #2d3a50; border-radius: 6px; }
+.scanner-wrapper { max-height: 520px; overflow-y: auto; overflow-x: hidden; border: 1px solid #2d3a50; border-radius: 6px; }
 .scanner-table { width: 100%; border-collapse: collapse; font-size: 10.5px; font-family: 'Courier New', monospace; table-layout: fixed; }
 .scanner-table th { background: #1e2535; color: #94a3b8; font-size: 9px; font-weight: 600; letter-spacing: 0.3px; padding: 3px 2px; text-align: center; border-bottom: 1px solid #2d3a50; position: sticky; top: 0; z-index: 1; overflow: hidden; white-space: nowrap; }
 .scanner-table td { padding: 3px 2px; text-align: center; border-bottom: 1px solid #1a2030; color: #000000; overflow: hidden; white-space: nowrap; }
@@ -1431,7 +1431,7 @@ with st.sidebar:
     st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  Liste yenilemede korunur.")
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
-col_l, col_c, col_r = st.columns([2.5, 5, 2.5])
+col_l, col_c, col_r = st.columns([3.2, 4, 2.8])
 df = get_data(secilen)
 
 # ══ SOL: SCANNER ══════════════════════════════════════════════════════════════
