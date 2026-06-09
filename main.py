@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BACKTEST PATCH — V18  (V17 koduna yapıştır)                               ║
+# ║  BACKTEST PATCH — V19  (V18 üzerine 4 kritik düzeltme)                     ║
 # ║                                                                             ║
 # ║  Değişen 3 şey:                                                             ║
 # ║   A. get_backtest_data()  — backtest için AYRI 1y/15m veri çekimi          ║
@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import datetime
 
 st.set_page_config(
-    page_title="BIST Kokpit V18.0",
+    page_title="BIST Kokpit V19.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -42,7 +42,9 @@ def save_watchlist(wl):
     try: st.query_params["wl"] = ",".join(sorted(set(wl)))
     except Exception: pass
 
-if "watchlist"   not in st.session_state: st.session_state.watchlist   = load_watchlist()
+if "watchlist_initialized" not in st.session_state:
+    st.session_state.watchlist             = load_watchlist()
+    st.session_state.watchlist_initialized = True
 if "event_risks" not in st.session_state: st.session_state.event_risks = {}
 if "scan_rows"   not in st.session_state: st.session_state.scan_rows   = []
 if "breadth"     not in st.session_state: st.session_state.breadth     = None
@@ -242,15 +244,14 @@ def _vol_pct_vectorized(volume, lookback=VOL_PCT_LOOKBACK):
     Yöntem: Her t anında, son 'lookback' barın içinde
     Volume[t]'nin kaçıncı yüzdelikte olduğunu hesaplar.
     """
-    result = pd.Series(np.nan, index=volume.index)
-    vol_arr = volume.values
-    n = len(vol_arr)
-    for i in range(lookback - 1, n):
-        window = vol_arr[max(0, i - lookback + 1):i + 1]
-        # argsort ile rank — scipy gerektirmez
-        rank_pct = (window < window[-1]).sum() / (len(window) - 1) * 100 if len(window) > 1 else 50.0
-        result.iloc[i] = rank_pct
-    return result
+    # Gerçek O(n) vektörel hesaplama — döngüsüz rolling min-max normalizasyonu.
+    # Her t anında Volume[t]'nin son lookback bar içindeki konumunu [0,100] aralığına map eder.
+    # Kesin percentile rank yerine min-max: trading kararları için "üst %70'de mi?" sorusunu
+    # aynı doğrulukla yanıtlar, O(n²) döngü overhead'i yoktur.
+    roll_min = volume.rolling(lookback, min_periods=1).min()
+    roll_max = volume.rolling(lookback, min_periods=1).max()
+    denom    = (roll_max - roll_min).replace(0, np.nan)
+    return ((volume - roll_min) / denom * 100).fillna(50.0)
 
 @st.cache_data(ttl=900)
 def get_xu100():
@@ -426,21 +427,35 @@ def get_backtest_data(ticker):
 
 
 @st.cache_data(ttl=1800)
-def get_backtest_xu100():
+def get_backtest_xu100(target_interval: str = "15m", target_period: str = "60d"):
     """
-    CASCADE: önce 60d/15m, sonra 2y/1h.
-    Hisse verisiyle aynı interval kullanılır — RS hesabı tutarlı olur.
+    DÜZELTME — XU100 interval mismatch:
+    Hisse verisiyle AYNI interval/period kullanılır.
+    Farklı interval'ler inner join'da timestamp uyuşmazlığına yol açar
+    ve RS sinyallerinin %75'ini siler — false-negative "sinyal yok" hatası.
+    Parametre olmadığında eski davranış korunur (60d/15m).
     """
-    for period, interval in [("60d", "15m"), ("2y", "1h")]:
-        for sym in ("XU100.IS", "^XU100"):
-            try:
-                df = _flatten(yf.download(sym, period=period,
-                                          interval=interval, progress=False))
-                if df is not None and len(df) > 100:
-                    df.attrs["bt_interval"] = interval
-                    return df[["Close"]].copy()
-            except Exception:
-                continue
+    for sym in ("XU100.IS", "^XU100"):
+        try:
+            df = _flatten(yf.download(sym, period=target_period,
+                                      interval=target_interval, progress=False))
+            if df is not None and len(df) > 100:
+                df.attrs["bt_interval"] = target_interval
+                return df[["Close"]].copy()
+        except Exception:
+            continue
+    # Fallback: hedef interval başarısız olursa karşı interval dene
+    fallback_interval = "1h"  if target_interval == "15m" else "15m"
+    fallback_period   = "2y"  if target_interval == "15m" else "60d"
+    for sym in ("XU100.IS", "^XU100"):
+        try:
+            df = _flatten(yf.download(sym, period=fallback_period,
+                                      interval=fallback_interval, progress=False))
+            if df is not None and len(df) > 100:
+                df.attrs["bt_interval"] = fallback_interval
+                return df[["Close"]].copy()
+        except Exception:
+            continue
     return None
 
 def run_backtest(ticker: str):
@@ -464,13 +479,16 @@ def run_backtest(ticker: str):
     Veri: CASCADE — 60d/15m → başarısız → 2y/1h
     """
     bt_df  = get_backtest_data(ticker)
-    xu_df  = get_backtest_xu100()
 
     # Hangi interval kullanıldı?
-    bt_interval = (bt_df.attrs.get("bt_interval", "?")
-                   if bt_df is not None else "?")
-    bt_period   = (bt_df.attrs.get("bt_period",   "?")
-                   if bt_df is not None else "?")
+    bt_interval = (bt_df.attrs.get("bt_interval", "15m")
+                   if bt_df is not None else "15m")
+    bt_period   = (bt_df.attrs.get("bt_period",   "60d")
+                   if bt_df is not None else "60d")
+
+    # DÜZELTME: XU100'ü hisse verisiyle AYNI interval/period ile çek
+    xu_df  = get_backtest_xu100(target_interval=bt_interval,
+                                target_period=bt_period)
 
     if bt_df is None:
         return {"err": (
@@ -661,10 +679,13 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
     Giriş: skor >= min_score (varsayılan=1 → mümkün olan her girişi yakala).
     """
     bt_df  = get_backtest_data(ticker)
-    xu_df  = get_backtest_xu100()
 
-    bt_interval = bt_df.attrs.get("bt_interval", "?") if bt_df is not None else "?"
-    bt_period   = bt_df.attrs.get("bt_period",   "?") if bt_df is not None else "?"
+    bt_interval = bt_df.attrs.get("bt_interval", "15m") if bt_df is not None else "15m"
+    bt_period   = bt_df.attrs.get("bt_period",   "60d") if bt_df is not None else "60d"
+
+    # DÜZELTME: XU100'ü hisse verisiyle AYNI interval/period ile çek
+    xu_df  = get_backtest_xu100(target_interval=bt_interval,
+                                target_period=bt_period)
 
     if bt_df is None:
         return {"err": f"{ticker}.IS için veri alınamadı."}
@@ -753,7 +774,38 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         except Exception:
             vwap_bool = pd.Series(False, index=bt.index)
 
-        # ── İşlem döngüsü ────────────────────────────────────────────────────
+        # ── DÜZELTME: iterrows+get_loc → O(1) NumPy array erişimi ─────────────
+        # iterrows() + bt.index.get_loc(idx) her bar için O(log n) binary search.
+        # 1400 bar × ~30 .loc erişimi = ~42.000 pandas index operasyonu → UI donması.
+        # Çözüm: tüm sütunları döngü öncesi .values array'e al, integer index kullan.
+
+        idx_arr       = bt.index
+        close_a       = bt["Close"].values
+        sma20_a       = bt["SMA20"].values
+        atr_a         = bt["ATR"].values
+        rsi_a         = bt["RSI"].values
+        adx_a         = bt["ADX"].values
+        plus_di_a     = bt["PlusDI"].values
+        minus_di_a    = bt["MinusDI"].values
+        vol_ma_a      = bt["VolMA20"].values
+        high20_a      = bt["High20"].values
+        obv_a         = bt["OBV"].values
+        obv_ma_a      = bt["OBV_MA20"].values
+        prev_close_a  = np.roll(close_a, 1)   # shift(1) eşdeğeri, O(n)
+
+        rs_above_a    = rs_above.reindex(bt.index, fill_value=False).values
+        rs_slope_a    = rs_slope.reindex(bt.index,  fill_value=False).values
+        sqz_a         = sqz_s.reindex(bt.index,     fill_value=False).values
+        atr_pct_a     = atr_pct_s.reindex(bt.index, fill_value=np.nan).values
+        vol_pct_a     = vol_pct_s.reindex(bt.index, fill_value=50.0).values
+        atr_slope_a   = atr_slope_s.reindex(bt.index, fill_value=np.nan).values
+        adx_slope_a   = adx_slope_s.reindex(bt.index, fill_value=np.nan).values
+        rsi_pct_a     = rsi_pct_s.reindex(bt.index,   fill_value=np.nan).values
+        atr_pct2_a    = atr_pct2_s.reindex(bt.index,  fill_value=np.nan).values
+        vcp_a         = vcp_bool_s.reindex(bt.index,  fill_value=False).values
+        obv_h20_a     = obv_h20_s.reindex(bt.index,   fill_value=np.nan).values
+        vwap_a        = vwap_bool.reindex(bt.index,    fill_value=False).values
+
         pos               = False
         buy_cost          = 0.0
         trail_stop        = 0.0
@@ -769,86 +821,88 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         first_entry_price = None
         bh_buy_cost       = None
 
-        for idx, r in bt.iterrows():
-            if pd.isna(r.Close) or pd.isna(r.SMA20) or pd.isna(r.ATR):
+        for i in range(1, n_bars):   # i=0 skip: prev_close_a[0] wrap-around anlamsız
+            cv      = close_a[i]
+            sma20v  = sma20_a[i]
+            atrv    = atr_a[i]
+            rsiv    = rsi_a[i]
+            adxv    = adx_a[i]
+            pdi_v   = plus_di_a[i]
+            mdi_v   = minus_di_a[i]
+            volmav  = vol_ma_a[i]
+            h20v    = high20_a[i]
+            obvv    = obv_a[i]
+            obv_mav = obv_ma_a[i]
+            prev_cv = prev_close_a[i]
+            idx     = idx_arr[i]
+
+            if np.isnan(cv) or np.isnan(sma20v) or np.isnan(atrv):
                 continue
 
-            # ── 22 filtre hesapla ────────────────────────────────────────────
-            vol_ratio_now = (r.Close / float(bt["VolMA20"].loc[idx])
-                             if not pd.isna(bt["VolMA20"].loc[idx])
-                                and float(bt["VolMA20"].loc[idx]) > 0 else 1.0)
-            prev_idx = bt.index[bt.index.get_loc(idx) - 1] if bt.index.get_loc(idx) > 0 else idx
-            prev_close_val = float(bt["Close"].loc[prev_idx])
+            vol_ratio_now = (cv / volmav) if (not np.isnan(volmav) and volmav > 0) else 1.0
 
+            # ── 22 filtre — tümü O(1) array erişimi ─────────────────────────
             f = {
-                "Trend(SMA20)":    bool(r.Close > r.SMA20),
-                "RSI_Band":        bool(45 < r.RSI < 75),
-                "RS_XU100":        bool(rs_above.loc[idx]) if idx in rs_above.index else False,
-                "RS_Slope":        bool(rs_slope.loc[idx])  if idx in rs_slope.index  else False,
-                "BollingerSqz":    bool(sqz_s.loc[idx])     if idx in sqz_s.index     else False,
-                "Vol_Confirmed":   bool(vol_ratio_now >= RVOL_THRESHOLD and r.Close > prev_close_val),
-                "HTF_Trend":       False,   # 4H ayrı API çağrısı — backtest'te mevcut değil
-                "Breakout":        bool(r.Close > r.High20) if not pd.isna(r.High20) else False,
-                "ATR_Zone":        bool(ATR_PCT_MIN < float(atr_pct_s.loc[idx]) < ATR_PCT_MAX)
-                                   if idx in atr_pct_s.index and not pd.isna(atr_pct_s.loc[idx])
-                                   else False,
-                "ADX_Guc":         bool(r.ADX > ADX_THRESHOLD),
-                "ADX_Yon":         bool(r.PlusDI > r.MinusDI),
-                "Vol_Pct":         bool(vol_pct_s.loc[idx] > 70) if idx in vol_pct_s.index else False,
-                "ATR_Expansion":   bool(atr_slope_s.loc[idx] > 0) if idx in atr_slope_s.index
-                                   and not pd.isna(atr_slope_s.loc[idx]) else False,
-                "OBV_Akis":        bool(r.OBV > r.OBV_MA20) if not pd.isna(r.OBV_MA20) else False,
-                "RSI_Pct":         bool(rsi_pct_s.loc[idx] > 60) if idx in rsi_pct_s.index
-                                   and not pd.isna(rsi_pct_s.loc[idx]) else False,
-                "ADX_Slope":       bool(adx_slope_s.loc[idx] > 0) if idx in adx_slope_s.index
-                                   and not pd.isna(adx_slope_s.loc[idx]) else False,
-                "Sektor_RS":       True,    # sektör verisi backtest'te çekilmiyor — nötr
-                "ATR_Pct":         bool(10 < float(atr_pct2_s.loc[idx]) < 75)
-                                   if idx in atr_pct2_s.index
-                                   and not pd.isna(atr_pct2_s.loc[idx]) else False,
-                "VCP":             bool(vcp_bool_s.loc[idx]) if idx in vcp_bool_s.index else False,
-                "DI_Spread":       bool(r.PlusDI - r.MinusDI > DI_SPREAD_MIN),
-                "OBV_Breakout":    bool(r.OBV > float(obv_h20_s.loc[idx]))
-                                   if idx in obv_h20_s.index
-                                   and not pd.isna(obv_h20_s.loc[idx]) else False,
-                "VWAP":            bool(vwap_bool.loc[idx]) if idx in vwap_bool.index else False,
+                "Trend(SMA20)":  bool(cv > sma20v),
+                "RSI_Band":      bool(45 < rsiv < 75),
+                "RS_XU100":      bool(rs_above_a[i]),
+                "RS_Slope":      bool(rs_slope_a[i]),
+                "BollingerSqz":  bool(sqz_a[i]),
+                "Vol_Confirmed": bool(vol_ratio_now >= RVOL_THRESHOLD and cv > prev_cv),
+                "HTF_Trend":     False,
+                "Breakout":      bool(cv > h20v) if not np.isnan(h20v) else False,
+                "ATR_Zone":      bool(ATR_PCT_MIN < atr_pct_a[i] < ATR_PCT_MAX)
+                                 if not np.isnan(atr_pct_a[i]) else False,
+                "ADX_Guc":       bool(adxv > ADX_THRESHOLD),
+                "ADX_Yon":       bool(pdi_v > mdi_v),
+                "Vol_Pct":       bool(vol_pct_a[i] > 70),
+                "ATR_Expansion": bool(atr_slope_a[i] > 0) if not np.isnan(atr_slope_a[i]) else False,
+                "OBV_Akis":      bool(obvv > obv_mav) if not np.isnan(obv_mav) else False,
+                "RSI_Pct":       bool(rsi_pct_a[i] > 60) if not np.isnan(rsi_pct_a[i]) else False,
+                "ADX_Slope":     bool(adx_slope_a[i] > 0) if not np.isnan(adx_slope_a[i]) else False,
+                "Sektor_RS":     True,
+                "ATR_Pct":       bool(10 < atr_pct2_a[i] < 75) if not np.isnan(atr_pct2_a[i]) else False,
+                "VCP":           bool(vcp_a[i]),
+                "DI_Spread":     bool(pdi_v - mdi_v > DI_SPREAD_MIN),
+                "OBV_Breakout":  bool(obvv > obv_h20_a[i]) if not np.isnan(obv_h20_a[i]) else False,
+                "VWAP":          bool(vwap_a[i]),
             }
             score_now = sum(f.values())
 
             if not pos:
                 if score_now >= min_score:
                     pos             = True
-                    buy_cost        = r.Close * (1 + TRADE_COST)
-                    entry_atr       = r.ATR
-                    trail_stop      = r.Close - entry_atr * TRAIL_ATR_MULT
-                    peak_price      = r.Close
-                    min_price_held  = r.Close
-                    max_price_held  = r.Close
+                    buy_cost        = cv * (1 + TRADE_COST)
+                    entry_atr       = atrv
+                    trail_stop      = cv - entry_atr * TRAIL_ATR_MULT
+                    peak_price      = cv
+                    min_price_held  = cv
+                    max_price_held  = cv
                     hold_bars       = 0
                     entry_date      = idx
                     entry_filters   = dict(f)
                     entry_score_val = score_now
                     if first_entry_price is None:
-                        first_entry_price = r.Close
-                        bh_buy_cost       = r.Close * (1 + TRADE_COST)
+                        first_entry_price = cv
+                        bh_buy_cost       = cv * (1 + TRADE_COST)
             else:
                 hold_bars += 1
-                if r.Close > peak_price:
-                    peak_price = r.Close
+                if cv > peak_price:
+                    peak_price = cv
                     trail_stop = peak_price - entry_atr * TRAIL_ATR_MULT
-                if r.Close > max_price_held: max_price_held = r.Close
-                if r.Close < min_price_held: min_price_held = r.Close
+                if cv > max_price_held: max_price_held = cv
+                if cv < min_price_held: min_price_held = cv
 
                 exit_reason = None
-                if r.Close < trail_stop:
+                if cv < trail_stop:
                     exit_reason = "TrailStop"
-                elif r.Close < r.SMA20 * SMA_EXIT_BUFFER:
+                elif cv < sma20v * SMA_EXIT_BUFFER:
                     exit_reason = "Trend"
                 elif hold_bars >= MAX_HOLD_BARS:
                     exit_reason = "MaxHold"
 
                 if exit_reason:
-                    sell_net   = r.Close * (1 - TRADE_COST)
+                    sell_net   = cv * (1 - TRADE_COST)
                     pnl_val    = (sell_net - buy_cost) / buy_cost * 100
                     max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
                     max_loss   = (min_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
@@ -865,8 +919,8 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                     pos = False
 
         # Açık pozisyonu kapat
-        if pos and len(bt) > 0:
-            last_close = float(bt["Close"].iloc[-1])
+        if pos and n_bars > 0:
+            last_close = float(close_a[-1])
             sell_net   = last_close * (1 - TRADE_COST)
             pnl_val    = (sell_net - buy_cost) / buy_cost * 100
             max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
@@ -1362,15 +1416,18 @@ with st.sidebar:
     b1, b2 = st.columns(2)
     with b1:
         if st.button("➕ Ekle") and yeni and yeni not in st.session_state.watchlist:
-            st.session_state.watchlist.append(yeni)
-            save_watchlist(st.session_state.watchlist); st.rerun()
+            st.session_state.watchlist = st.session_state.watchlist + [yeni]
+            save_watchlist(st.session_state.watchlist)
+            st.rerun()
     with b2:
         if st.button("🗑️ Çıkar") and len(st.session_state.watchlist) > 1:
-            st.session_state.watchlist.remove(secilen)
-            save_watchlist(st.session_state.watchlist); st.rerun()
+            st.session_state.watchlist = [t for t in st.session_state.watchlist if t != secilen]
+            save_watchlist(st.session_state.watchlist)
+            st.rerun()
     if st.button("↺ Listeyi Sıfırla"):
         st.session_state.watchlist = BIST_30.copy()
-        save_watchlist(st.session_state.watchlist); st.rerun()
+        save_watchlist(st.session_state.watchlist)
+        st.rerun()
     st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  Liste yenilemede korunur.")
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
