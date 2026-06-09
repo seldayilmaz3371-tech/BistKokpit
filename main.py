@@ -640,6 +640,353 @@ def run_backtest(ticker: str):
     except Exception as e:
         return {"err": f"Hesaplama hatası: {str(e)}"}
 
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  VALIDATION BACKTEST — Composite Score & Filtre Katkı Analizi              ║
+# ║                                                                             ║
+# ║  Mevcut run_backtest() 6 filtre kullanır ve skor kaydetmez.                ║
+# ║  Bu fonksiyon:                                                              ║
+# ║    1. Backtest döngüsünde 22 filtrenin tamamını hesaplar                   ║
+# ║    2. Giriş anındaki skoru ve filtre durumlarını kaydeder                  ║
+# ║    3. Skor grubuna göre metrikleri gruplandırır                            ║
+# ║    4. Her filtrenin "varsa/yoksa" performansını hesaplar                   ║
+# ║                                                                             ║
+# ║  Giriş koşulu: skor >= min_score (varsayılan 1 — tüm girişler)             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+def run_validation_backtest(ticker: str, min_score: int = 1):
+    """
+    22 filtreli Validation Backtest.
+    Her işlem için giriş skoru ve tüm filtre durumları kaydedilir.
+    Giriş: skor >= min_score (varsayılan=1 → mümkün olan her girişi yakala).
+    """
+    bt_df  = get_backtest_data(ticker)
+    xu_df  = get_backtest_xu100()
+
+    bt_interval = bt_df.attrs.get("bt_interval", "?") if bt_df is not None else "?"
+    bt_period   = bt_df.attrs.get("bt_period",   "?") if bt_df is not None else "?"
+
+    if bt_df is None:
+        return {"err": f"{ticker}.IS için veri alınamadı."}
+    if len(bt_df) < 100:
+        return {"err": f"Yeterli veri yok ({len(bt_df)} bar < 100)"}
+
+    try:
+        # ── RS serisi (backtest verisiyle hizalı, lookahead yok) ────────────
+        if xu_df is not None and len(xu_df) > 20:
+            aligned   = bt_df[["Close"]].join(xu_df["Close"].rename("XU100"), how="inner")
+            rs_raw    = aligned["Close"] / aligned["XU100"]
+            rs_ma20   = rs_raw.rolling(20).mean()
+            rs_above  = (rs_raw > rs_ma20).reindex(bt_df.index, fill_value=False)
+            rs_slope  = (rs_raw.diff(RS_SLOPE_BARS) > 0).reindex(bt_df.index, fill_value=False)
+        else:
+            rs_above = pd.Series(True,  index=bt_df.index)
+            rs_slope = pd.Series(False, index=bt_df.index)
+
+        # ── Ek göstergeler (backtest verisinde hesaplanmayanlar) ────────────
+        bt = bt_df.copy()
+        c  = bt["Close"]
+
+        # Bollinger Squeeze
+        sma20_bt  = c.rolling(20).mean()
+        bb_w      = (4 * c.rolling(20).std()) / sma20_bt.replace(0, np.nan)
+        sqz_thr   = bb_w.rolling(SQUEEZE_LOOKBACK, min_periods=30).quantile(0.15)
+        sqz_s     = bb_w < sqz_thr
+
+        # ATR% (ATR/fiyat — volatilite bölgesi filtresi)
+        atr_pct_s = bt["ATR"] / c.replace(0, np.nan)
+
+        # OBV Breakout
+        obv_h20_s = bt["OBV"].rolling(OBV_BRK_LOOKBACK).max().shift(1)
+
+        # VolPct (basitleştirilmiş — tam backtest verisinde 250 bar pencere)
+        vol_arr = bt["Volume"].values
+        n_bars  = len(vol_arr)
+        vol_pct_arr = np.full(n_bars, 50.0)
+        for i in range(VOL_PCT_LOOKBACK - 1, n_bars):
+            w = vol_arr[max(0, i - VOL_PCT_LOOKBACK + 1):i + 1]
+            vol_pct_arr[i] = (w < w[-1]).sum() / (len(w) - 1) * 100 if len(w) > 1 else 50.0
+        vol_pct_s = pd.Series(vol_pct_arr, index=bt.index)
+
+        # ATR Slope
+        atr_slope_s = bt["ATR"].diff(ATR_EXP_BARS)
+
+        # ADX Slope
+        adx_slope_s = bt["ADX"].diff(ADX_SLOPE_BARS)
+
+        # RSI Pct (rolling rank — min_periods=30 ile)
+        rsi_pct_s = (bt["RSI"]
+                     .rolling(RSI_PCT_LOOKBACK, min_periods=30)
+                     .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100
+                            if len(x) > 1 else 50.0, raw=True))
+
+        # ATR Pct percentile
+        atr_pct2_s = (bt["ATR"]
+                      .rolling(ATR_PCT_LOOKBACK, min_periods=30)
+                      .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100
+                             if len(x) > 1 else 50.0, raw=True))
+
+        # VCP: std ve volume daralması — pencere bazlı
+        vcp_s_arr = np.zeros(n_bars, dtype=bool)
+        for i in range(VCP_LOOKBACK, n_bars):
+            c_w  = c.iloc[i - VCP_LOOKBACK:i + 1]
+            v_w  = bt["Volume"].iloc[i - VCP_LOOKBACK:i + 1]
+            std_r = c_w.iloc[-20:].std()
+            std_l = c_w.std()
+            vol_r = v_w.iloc[-20:].mean()
+            vol_l = v_w.mean()
+            pc = (std_r < std_l * 0.85) if std_l > 0 else False
+            vc = (vol_r < vol_l * 0.75)  if vol_l  > 0 else False
+            rs_flag = float(c_w.iloc[-1]) > float(c_w.iloc[-20])
+            vcp_s_arr[i] = (int(pc) + int(vc) + int(rs_flag)) >= 2
+        vcp_bool_s = pd.Series(vcp_s_arr, index=bt.index)
+
+        # VWAP (intraday — backtest verisinde hesaplanabilir)
+        try:
+            typical   = (bt["High"] + bt["Low"] + bt["Close"]) / 3
+            pv        = typical * bt["Volume"]
+            date_idx  = bt.index.normalize()
+            cum_pv    = pv.groupby(date_idx).cumsum()
+            cum_vol   = bt["Volume"].groupby(date_idx).cumsum()
+            vwap_s    = cum_pv / cum_vol.replace(0, np.nan)
+            vwap_bool = c > vwap_s
+        except Exception:
+            vwap_bool = pd.Series(False, index=bt.index)
+
+        # ── İşlem döngüsü ────────────────────────────────────────────────────
+        pos               = False
+        buy_cost          = 0.0
+        trail_stop        = 0.0
+        entry_atr         = 0.0
+        peak_price        = 0.0
+        hold_bars         = 0
+        entry_date        = None
+        entry_filters     = {}
+        entry_score_val   = 0
+        min_price_held    = 0.0
+        max_price_held    = 0.0
+        trades            = []
+        first_entry_price = None
+        bh_buy_cost       = None
+
+        for idx, r in bt.iterrows():
+            if pd.isna(r.Close) or pd.isna(r.SMA20) or pd.isna(r.ATR):
+                continue
+
+            # ── 22 filtre hesapla ────────────────────────────────────────────
+            vol_ratio_now = (r.Close / float(bt["VolMA20"].loc[idx])
+                             if not pd.isna(bt["VolMA20"].loc[idx])
+                                and float(bt["VolMA20"].loc[idx]) > 0 else 1.0)
+            prev_idx = bt.index[bt.index.get_loc(idx) - 1] if bt.index.get_loc(idx) > 0 else idx
+            prev_close_val = float(bt["Close"].loc[prev_idx])
+
+            f = {
+                "Trend(SMA20)":    bool(r.Close > r.SMA20),
+                "RSI_Band":        bool(45 < r.RSI < 75),
+                "RS_XU100":        bool(rs_above.loc[idx]) if idx in rs_above.index else False,
+                "RS_Slope":        bool(rs_slope.loc[idx])  if idx in rs_slope.index  else False,
+                "BollingerSqz":    bool(sqz_s.loc[idx])     if idx in sqz_s.index     else False,
+                "Vol_Confirmed":   bool(vol_ratio_now >= RVOL_THRESHOLD and r.Close > prev_close_val),
+                "HTF_Trend":       False,   # 4H ayrı API çağrısı — backtest'te mevcut değil
+                "Breakout":        bool(r.Close > r.High20) if not pd.isna(r.High20) else False,
+                "ATR_Zone":        bool(ATR_PCT_MIN < float(atr_pct_s.loc[idx]) < ATR_PCT_MAX)
+                                   if idx in atr_pct_s.index and not pd.isna(atr_pct_s.loc[idx])
+                                   else False,
+                "ADX_Guc":         bool(r.ADX > ADX_THRESHOLD),
+                "ADX_Yon":         bool(r.PlusDI > r.MinusDI),
+                "Vol_Pct":         bool(vol_pct_s.loc[idx] > 70) if idx in vol_pct_s.index else False,
+                "ATR_Expansion":   bool(atr_slope_s.loc[idx] > 0) if idx in atr_slope_s.index
+                                   and not pd.isna(atr_slope_s.loc[idx]) else False,
+                "OBV_Akis":        bool(r.OBV > r.OBV_MA20) if not pd.isna(r.OBV_MA20) else False,
+                "RSI_Pct":         bool(rsi_pct_s.loc[idx] > 60) if idx in rsi_pct_s.index
+                                   and not pd.isna(rsi_pct_s.loc[idx]) else False,
+                "ADX_Slope":       bool(adx_slope_s.loc[idx] > 0) if idx in adx_slope_s.index
+                                   and not pd.isna(adx_slope_s.loc[idx]) else False,
+                "Sektor_RS":       True,    # sektör verisi backtest'te çekilmiyor — nötr
+                "ATR_Pct":         bool(10 < float(atr_pct2_s.loc[idx]) < 75)
+                                   if idx in atr_pct2_s.index
+                                   and not pd.isna(atr_pct2_s.loc[idx]) else False,
+                "VCP":             bool(vcp_bool_s.loc[idx]) if idx in vcp_bool_s.index else False,
+                "DI_Spread":       bool(r.PlusDI - r.MinusDI > DI_SPREAD_MIN),
+                "OBV_Breakout":    bool(r.OBV > float(obv_h20_s.loc[idx]))
+                                   if idx in obv_h20_s.index
+                                   and not pd.isna(obv_h20_s.loc[idx]) else False,
+                "VWAP":            bool(vwap_bool.loc[idx]) if idx in vwap_bool.index else False,
+            }
+            score_now = sum(f.values())
+
+            if not pos:
+                if score_now >= min_score:
+                    pos             = True
+                    buy_cost        = r.Close * (1 + TRADE_COST)
+                    entry_atr       = r.ATR
+                    trail_stop      = r.Close - entry_atr * TRAIL_ATR_MULT
+                    peak_price      = r.Close
+                    min_price_held  = r.Close
+                    max_price_held  = r.Close
+                    hold_bars       = 0
+                    entry_date      = idx
+                    entry_filters   = dict(f)
+                    entry_score_val = score_now
+                    if first_entry_price is None:
+                        first_entry_price = r.Close
+                        bh_buy_cost       = r.Close * (1 + TRADE_COST)
+            else:
+                hold_bars += 1
+                if r.Close > peak_price:
+                    peak_price = r.Close
+                    trail_stop = peak_price - entry_atr * TRAIL_ATR_MULT
+                if r.Close > max_price_held: max_price_held = r.Close
+                if r.Close < min_price_held: min_price_held = r.Close
+
+                exit_reason = None
+                if r.Close < trail_stop:
+                    exit_reason = "TrailStop"
+                elif r.Close < r.SMA20 * SMA_EXIT_BUFFER:
+                    exit_reason = "Trend"
+                elif hold_bars >= MAX_HOLD_BARS:
+                    exit_reason = "MaxHold"
+
+                if exit_reason:
+                    sell_net   = r.Close * (1 - TRADE_COST)
+                    pnl_val    = (sell_net - buy_cost) / buy_cost * 100
+                    max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
+                    max_loss   = (min_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
+                    trades.append({
+                        "entry_date":   str(entry_date)[:16],
+                        "score":        entry_score_val,
+                        "pnl":          pnl_val,
+                        "bars":         hold_bars,
+                        "why":          exit_reason,
+                        "max_profit":   max_profit,
+                        "max_loss":     max_loss,
+                        "filters":      entry_filters,
+                    })
+                    pos = False
+
+        # Açık pozisyonu kapat
+        if pos and len(bt) > 0:
+            last_close = float(bt["Close"].iloc[-1])
+            sell_net   = last_close * (1 - TRADE_COST)
+            pnl_val    = (sell_net - buy_cost) / buy_cost * 100
+            max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
+            max_loss   = (min_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
+            trades.append({
+                "entry_date":   str(entry_date)[:16],
+                "score":        entry_score_val,
+                "pnl":          pnl_val,
+                "bars":         hold_bars,
+                "why":          "EndOfData",
+                "max_profit":   max_profit,
+                "max_loss":     max_loss,
+                "filters":      entry_filters,
+            })
+
+        if not trades:
+            return {"err": f"Hiç işlem sinyali oluşmadı (min_score={min_score}, {len(bt)} bar)."}
+
+        # ── Skor Grubu Analizi ────────────────────────────────────────────────
+        SCORE_BINS = [
+            ("0–9",   0,  9),
+            ("10–12", 10, 12),
+            ("13–15", 13, 15),
+            ("16–18", 16, 18),
+            ("19–22", 19, 22),
+        ]
+
+        def _group_metrics(trade_list):
+            if not trade_list:
+                return None
+            pnls   = [t["pnl"]  for t in trade_list]
+            wins   = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            pf     = sum(wins) / abs(sum(losses)) if losses else float("inf")
+            eq     = 1.0
+            eq_c   = [1.0]
+            for p in pnls:
+                eq *= (1 + p / 100)
+                eq_c.append(eq)
+            eq_s   = pd.Series(eq_c)
+            dd     = (eq_s / eq_s.cummax() - 1).min() * 100
+            return {
+                "n":          len(trade_list),
+                "wr":         len(wins) / len(trade_list) * 100,
+                "avg_pnl":    float(np.mean(pnls)),
+                "med_pnl":    float(np.median(pnls)),
+                "pf":         pf,
+                "max_dd":     dd,
+                "avg_bars":   float(np.mean([t["bars"] for t in trade_list])),
+                "avg_maxp":   float(np.mean([t["max_profit"] for t in trade_list])),
+                "avg_maxl":   float(np.mean([t["max_loss"]   for t in trade_list])),
+            }
+
+        score_groups = {}
+        for lbl, lo, hi in SCORE_BINS:
+            subset = [t for t in trades if lo <= t["score"] <= hi]
+            score_groups[lbl] = _group_metrics(subset)
+
+        # ── Filtre Katkı Analizi ──────────────────────────────────────────────
+        filter_names = list(trades[0]["filters"].keys()) if trades else []
+        filter_contrib = {}
+        for fn in filter_names:
+            with_f    = [t for t in trades if t["filters"].get(fn, False)]
+            without_f = [t for t in trades if not t["filters"].get(fn, False)]
+            filter_contrib[fn] = {
+                "with":    _group_metrics(with_f),
+                "without": _group_metrics(without_f),
+            }
+
+        # ── Trend tespiti (skor arttıkça performans artıyor mu?) ─────────────
+        valid_groups = [(lbl, score_groups[lbl]) for lbl in ["0–9","10–12","13–15","16–18","19–22"]
+                        if score_groups[lbl] is not None and score_groups[lbl]["n"] >= 3]
+        if len(valid_groups) >= 2:
+            wrs     = [g[1]["wr"]      for g in valid_groups]
+            avgs    = [g[1]["avg_pnl"] for g in valid_groups]
+            wr_mono  = all(wrs[i] <= wrs[i+1] for i in range(len(wrs)-1))
+            avg_mono = all(avgs[i] <= avgs[i+1] for i in range(len(avgs)-1))
+            if wr_mono and avg_mono:
+                trend_verdict = "✅ ARTIYOR — Skor yükseldikçe hem win rate hem getiri artıyor"
+            elif not wr_mono and not avg_mono:
+                trend_verdict = "❌ İLİŞKİ YOK — Skor ile performans arasında monoton ilişki yok"
+            else:
+                trend_verdict = "⚠️ KARIŞIK — Bazı metrikler artıyor, bazıları artmıyor"
+        else:
+            trend_verdict = "⚠️ YETERSİZ VERİ — Bazı gruplarda < 3 işlem var"
+
+        last_price = float(bt["Close"].iloc[-1])
+        if first_entry_price is not None and bh_buy_cost is not None:
+            bh_adil = (last_price * (1 - TRADE_COST) / bh_buy_cost - 1) * 100
+        else:
+            bh_adil = 0.0
+
+        pnls_all  = [t["pnl"] for t in trades]
+        wins_all  = [p for p in pnls_all if p > 0]
+        losses_all = [p for p in pnls_all if p < 0]
+        eq = 1.0
+        for p in pnls_all:
+            eq *= (1 + p / 100)
+
+        return {
+            "err":            None,
+            "trades":         trades,
+            "n":              len(trades),
+            "total":          (eq - 1) * 100,
+            "wr":             len(wins_all) / len(trades) * 100,
+            "pf":             sum(wins_all) / abs(sum(losses_all)) if losses_all else float("inf"),
+            "bh":             bh_adil,
+            "score_groups":   score_groups,
+            "filter_contrib": filter_contrib,
+            "trend_verdict":  trend_verdict,
+            "interval":       bt_interval,
+            "period":         bt_period,
+            "bars":           len(bt_df),
+            "min_score":      min_score,
+        }
+
+    except Exception as e:
+        return {"err": f"Validation hesaplama hatası: {str(e)}"}
+
+
 # ── Diğer fonksiyonlar V17 ile aynı ─────────────────────────────────────────
 
 def bollinger_squeeze(close):
@@ -1027,7 +1374,7 @@ with st.sidebar:
     st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  Liste yenilemede korunur.")
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
-col_l, col_c, col_r = st.columns([3.5, 4, 2.5])
+col_l, col_c, col_r = st.columns([2.5, 5, 2.5])
 df = get_data(secilen)
 
 # ══ SOL: SCANNER ══════════════════════════════════════════════════════════════
@@ -1313,141 +1660,299 @@ with col_r:
             st.caption("⏱️ 15dk gecikmeli veri.")
 
         # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  TAB 3 — BACKTEST V18  (6 sorun düzeltildi)                    ║
+        # ║  TAB 3 — BACKTEST + VALIDATION                                  ║
         # ╚══════════════════════════════════════════════════════════════════╝
         with tab3:
-            # Backtest bilgi kutusu — veri dinamik (CASCADE'e göre değişir)
-            st.markdown(
-                f"<div class='bt-info-box'>"
-                f"<div class='bt-title'>V18 Backtest Mimarisi</div>"
-                f"<div class='bt-row'><span class='bt-lbl'>Veri</span>"
-                f"<span class='bt-val'>60d/15m → 2y/1h (cascade)</span></div>"
-                f"<div class='bt-row'><span class='bt-lbl'>Giriş</span>"
-                f"<span class='bt-val'>{BT_CORE_FILTERS} core filtre</span></div>"
-                f"<div class='bt-row'><span class='bt-lbl'>Stop</span>"
-                f"<span class='bt-val'>ATR × {TRAIL_ATR_MULT} Trailing</span></div>"
-                f"<div class='bt-row'><span class='bt-lbl'>Max Süre</span>"
-                f"<span class='bt-val'>{MAX_HOLD_BARS} bar</span></div>"
-                f"<div class='bt-row'><span class='bt-lbl'>Maliyet</span>"
-                f"<span class='bt-val'>%{TRADE_COST*100:.2f} / işlem</span></div>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
+            bt_sub, val_sub = st.tabs(["📊 Backtest (6 Core)", "🔬 Validation (22 Filtre)"])
 
-            if st.button("▶ Backtest Çalıştır", key="bt_run"):
-                with st.spinner("Veri yükleniyor (60d/15m → 2y/1h cascade)..."):
-                    res = run_backtest(secilen)
-                st.session_state["bt_result"] = res
-                st.session_state["bt_ticker"] = secilen
+            # ── Alt Sekme 1: Mevcut Backtest (değiştirilmedi) ────────────────
+            with bt_sub:
+                st.markdown(
+                    f"<div class='bt-info-box'>"
+                    f"<div class='bt-title'>V18 Backtest Mimarisi</div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Veri</span>"
+                    f"<span class='bt-val'>60d/15m → 2y/1h (cascade)</span></div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Giriş</span>"
+                    f"<span class='bt-val'>{BT_CORE_FILTERS} core filtre</span></div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Stop</span>"
+                    f"<span class='bt-val'>ATR × {TRAIL_ATR_MULT} Trailing</span></div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Max Süre</span>"
+                    f"<span class='bt-val'>{MAX_HOLD_BARS} bar</span></div>"
+                    f"<div class='bt-row'><span class='bt-lbl'>Maliyet</span>"
+                    f"<span class='bt-val'>%{TRADE_COST*100:.2f} / işlem</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
 
-            # Sonuç gösterimi
-            res       = st.session_state.get("bt_result")
-            bt_ticker = st.session_state.get("bt_ticker", "")
+                if st.button("▶ Backtest Çalıştır", key="bt_run"):
+                    with st.spinner("Veri yükleniyor (60d/15m → 2y/1h cascade)..."):
+                        res = run_backtest(secilen)
+                    st.session_state["bt_result"] = res
+                    st.session_state["bt_ticker"] = secilen
 
-            if res is None:
-                st.info("▶ Butona basarak backtest başlatın.")
-            elif res.get("err"):
-                st.warning(f"ℹ️ {res['err']}")
-            else:
-                if bt_ticker != secilen:
-                    st.warning(
-                        f"⚠️ Gösterilen sonuç {bt_ticker} için. "
-                        f"{secilen} için tekrar çalıştırın."
+                res       = st.session_state.get("bt_result")
+                bt_ticker = st.session_state.get("bt_ticker", "")
+
+                if res is None:
+                    st.info("▶ Butona basarak backtest başlatın.")
+                elif res.get("err"):
+                    st.warning(f"ℹ️ {res['err']}")
+                else:
+                    if bt_ticker != secilen:
+                        st.warning(
+                            f"⚠️ Gösterilen sonuç {bt_ticker} için. "
+                            f"{secilen} için tekrar çalıştırın."
+                        )
+
+                    ret_cls  = "up" if res["total"] >= 0 else "dn"
+                    pf_str   = f"{res['pf']:.2f}" if res["pf"] != float("inf") else "∞"
+                    interval = res.get("interval", "?")
+                    period   = res.get("period",   "?")
+
+                    iv_cls = "up" if interval == "15m" else "wn"
+                    st.markdown(
+                        f"<div class='bt-info-box' style='margin-bottom:6px'>"
+                        f"<div class='bt-title'>V20 — Kullanılan Veri & Düzeltmeler</div>"
+                        f"<div class='bt-row'>"
+                        f"<span class='bt-lbl'>Interval / Period</span>"
+                        f"<span class='bt-val {iv_cls}'>{interval} / {period} ({res['bars']} bar)</span>"
+                        f"</div>"
+                        f"<div class='bt-row'>"
+                        f"<span class='bt-lbl'>Getiri Yöntemi</span>"
+                        f"<span class='bt-val up'>Bileşik (gerçek sermaye büyümesi)</span>"
+                        f"</div>"
+                        f"<div class='bt-row'>"
+                        f"<span class='bt-lbl'>Al-Bekle Karşılaştırma</span>"
+                        f"<span class='bt-val up'>İlk giriş anından, komisyon dahil</span>"
+                        f"</div>"
+                        f"<div class='bt-row'>"
+                        f"<span class='bt-lbl'>Max Hold</span>"
+                        f"<span class='bt-val up'>{MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26} iş günü)</span>"
+                        f"</div>"
+                        f"<div class='bt-row'>"
+                        f"<span class='bt-lbl'>SMA Çıkış</span>"
+                        f"<span class='bt-val up'>SMA20 × {SMA_EXIT_BUFFER} (buffer, churn önler)</span>"
+                        f"</div>"
+                        f"</div>",
+                        unsafe_allow_html=True
                     )
 
-                ret_cls  = "up" if res["total"] >= 0 else "dn"
-                pf_str   = f"{res['pf']:.2f}" if res["pf"] != float("inf") else "∞"
-                interval = res.get("interval", "?")
-                period   = res.get("period",   "?")
+                    st.markdown(metric_grid(
+                        ("Robot Getiri (bileşik)", f"%{res['total']:.2f}", ret_cls),
+                        ("Al-Bekle (adil)",        f"%{res['bh']:.2f}",
+                         "up" if res["bh"] >= 0 else "dn"),
+                        ("Win Rate",               f"%{res['wr']:.1f}",
+                         "up" if res["wr"] >= 50 else "dn"),
+                        ("Profit Factor",          pf_str,
+                         "up" if res["pf"] > 1 else "dn"),
+                        ("Max Drawdown",           f"%{res['dd']:.1f}", "dn"),
+                        ("İşlem Sayısı",           str(res["n"]),
+                         "up" if res["n"] >= 5 else "wn"),
+                    ), unsafe_allow_html=True)
 
-                # Hangi veri kullanıldı — kullanıcıya göster
-                iv_cls = "up" if interval == "15m" else "wn"
-                iv_lbl = "✅ 15m (tutarlı)" if interval == "15m" else "⚠️ 1h (fallback)"
+                    simple_total = res.get("total_simple", res["total"])
+                    bh_eski      = res.get("bh_eski", res["bh"])
+                    st.markdown(
+                        f"<div class='bt-info-box' style='margin-top:4px'>"
+                        f"<div class='bt-title'>Eski Yöntem ile Karşılaştırma (referans)</div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>Robot (eski aritmetik)</span>"
+                        f"<span class='bt-val {'up' if simple_total>=0 else 'dn'}'>%{simple_total:.2f}</span></div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>Al-Bekle (eski, veri başından)</span>"
+                        f"<span class='bt-val {'up' if bh_eski>=0 else 'dn'}'>%{bh_eski:.2f}</span></div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    st.markdown(metric_grid(
+                        ("Ort. Süre",   f"{res['avg_bars']:.0f} bar",   ""),
+                        ("Test Verisi", f"{res['bars']} bar / {period}", ""),
+                    ), unsafe_allow_html=True)
+
+                    if res["total"] > res["bh"]:
+                        st.success("💪 Robot Al-Bekle'yi Yendi! (Bileşik Getiri, Adil BH, Maliyet Dahil)")
+                    else:
+                        st.warning("🐢 Al-Bekle Daha İyi Performans Gösterdi")
+
+                    ec = res["ec"]
+                    st.markdown(
+                        f"<div class='bt-info-box' style='margin-top:6px'>"
+                        f"<div class='bt-title'>Çıkış Nedeni Dağılımı</div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>🛡️ Trailing Stop</span>"
+                        f"<span class='bt-val'>{ec.get('TrailStop',0)}</span></div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>📉 Trend (SMA×{SMA_EXIT_BUFFER})</span>"
+                        f"<span class='bt-val'>{ec.get('Trend',0)}</span></div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>⏱️ Max Süre ({MAX_HOLD_BARS} bar)</span>"
+                        f"<span class='bt-val wn'>{ec.get('MaxHold',0)}</span></div>"
+                        f"<div class='bt-row'><span class='bt-lbl'>📋 Veri Sonu</span>"
+                        f"<span class='bt-val'>{ec.get('EndOfData',0)}</span></div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                    st.caption(
+                        f"V20 Düzeltmeleri: ①Bileşik getiri ②BH adil karşılaştırma (ilk giriş anı + komisyon) "
+                        f"③MAX_HOLD {MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26:.0f} iş günü) "
+                        f"④SMA20 çıkış buffer %{(1-SMA_EXIT_BUFFER)*100:.1f} ⑤DD bileşik equity curve  \n"
+                        f"Giriş: Trend+RSI(45-75)+RS+ADX>20++DI>-DI+Breakout  \n"
+                        f"Canlı 22 filtreden {BT_CORE_FILTERS} core — istatistiksel anlam için sadeleştirildi."
+                    )
+
+            # ── Alt Sekme 2: Validation (22 Filtre + Skor Analizi) ───────────
+            with val_sub:
                 st.markdown(
-                    f"<div class='bt-info-box' style='margin-bottom:6px'>"
-                    f"<div class='bt-title'>V20 — Kullanılan Veri & Düzeltmeler</div>"
-                    f"<div class='bt-row'>"
-                    f"<span class='bt-lbl'>Interval / Period</span>"
-                    f"<span class='bt-val {iv_cls}'>{interval} / {period} ({res['bars']} bar)</span>"
-                    f"</div>"
-                    f"<div class='bt-row'>"
-                    f"<span class='bt-lbl'>Getiri Yöntemi</span>"
-                    f"<span class='bt-val up'>Bileşik (gerçek sermaye büyümesi)</span>"
-                    f"</div>"
-                    f"<div class='bt-row'>"
-                    f"<span class='bt-lbl'>Al-Bekle Karşılaştırma</span>"
-                    f"<span class='bt-val up'>İlk giriş anından, komisyon dahil</span>"
-                    f"</div>"
-                    f"<div class='bt-row'>"
-                    f"<span class='bt-lbl'>Max Hold</span>"
-                    f"<span class='bt-val up'>{MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26} iş günü)</span>"
-                    f"</div>"
-                    f"<div class='bt-row'>"
-                    f"<span class='bt-lbl'>SMA Çıkış</span>"
-                    f"<span class='bt-val up'>SMA20 × {SMA_EXIT_BUFFER} (buffer, churn önler)</span>"
-                    f"</div>"
-                    f"</div>",
+                    "<div class='bt-info-box'>"
+                    "<div class='bt-title'>🔬 Composite Score Validation Testi</div>"
+                    "<div class='bt-row'><span class='bt-lbl'>Amaç</span>"
+                    "<span class='bt-val'>Skor arttıkça performans artıyor mu?</span></div>"
+                    "<div class='bt-row'><span class='bt-lbl'>Filtre sayısı</span>"
+                    "<span class='bt-val'>22 (HTF ve Sektör RS hariç — ayrı API gerektirir)</span></div>"
+                    "<div class='bt-row'><span class='bt-lbl'>Giriş koşulu</span>"
+                    "<span class='bt-val'>skor ≥ 1 (tüm girişleri yakala)</span></div>"
+                    "<div class='bt-row'><span class='bt-lbl'>Kayıt</span>"
+                    "<span class='bt-val'>Her işlemde: skor, 22 filtre durumu, max kâr/zarar</span></div>"
+                    "</div>",
                     unsafe_allow_html=True
                 )
 
-                st.markdown(metric_grid(
-                    ("Robot Getiri (bileşik)", f"%{res['total']:.2f}", ret_cls),
-                    ("Al-Bekle (adil)",        f"%{res['bh']:.2f}",
-                     "up" if res["bh"] >= 0 else "dn"),
-                    ("Win Rate",               f"%{res['wr']:.1f}",
-                     "up" if res["wr"] >= 50 else "dn"),
-                    ("Profit Factor",          pf_str,
-                     "up" if res["pf"] > 1 else "dn"),
-                    ("Max Drawdown",           f"%{res['dd']:.1f}", "dn"),
-                    ("İşlem Sayısı",           str(res["n"]),
-                     "up" if res["n"] >= 5 else "wn"),
-                ), unsafe_allow_html=True)
-
-                # Referans: eski yöntemle karşılaştırma
-                simple_total = res.get("total_simple", res["total"])
-                bh_eski      = res.get("bh_eski", res["bh"])
-                st.markdown(
-                    f"<div class='bt-info-box' style='margin-top:4px'>"
-                    f"<div class='bt-title'>Eski Yöntem ile Karşılaştırma (referans)</div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>Robot (eski aritmetik)</span>"
-                    f"<span class='bt-val {'up' if simple_total>=0 else 'dn'}'>%{simple_total:.2f}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>Al-Bekle (eski, veri başından)</span>"
-                    f"<span class='bt-val {'up' if bh_eski>=0 else 'dn'}'>%{bh_eski:.2f}</span></div>"
-                    f"</div>",
-                    unsafe_allow_html=True
+                val_min_score = st.slider(
+                    "Minimum giriş skoru:", min_value=1, max_value=18, value=1,
+                    help="1 = tüm girişler. Yükseltin → daha seçici, daha az işlem.",
+                    key="val_min_score"
                 )
 
-                st.markdown(metric_grid(
-                    ("Ort. Süre",   f"{res['avg_bars']:.0f} bar",       ""),
-                    ("Test Verisi", f"{res['bars']} bar / {period}", ""),
-                ), unsafe_allow_html=True)
+                if st.button("🔬 Validation Çalıştır", key="val_run"):
+                    with st.spinner("22 filtre hesaplanıyor — bu 30-60 sn sürebilir..."):
+                        vres = run_validation_backtest(secilen, min_score=val_min_score)
+                    st.session_state["val_result"] = vres
+                    st.session_state["val_ticker"] = secilen
 
-                if res["total"] > res["bh"]:
-                    st.success("💪 Robot Al-Bekle'yi Yendi! (Bileşik Getiri, Adil BH, Maliyet Dahil)")
+                vres      = st.session_state.get("val_result")
+                val_tick  = st.session_state.get("val_ticker", "")
+
+                if vres is None:
+                    st.info("🔬 Butona basarak validation başlatın.")
+                elif vres.get("err"):
+                    st.warning(f"ℹ️ {vres['err']}")
                 else:
-                    st.warning("🐢 Al-Bekle Daha İyi Performans Gösterdi")
+                    if val_tick != secilen:
+                        st.warning(f"⚠️ Gösterilen sonuç {val_tick} için. {secilen} için tekrar çalıştırın.")
 
-                ec = res["ec"]
-                st.markdown(
-                    f"<div class='bt-info-box' style='margin-top:6px'>"
-                    f"<div class='bt-title'>Çıkış Nedeni Dağılımı</div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>🛡️ Trailing Stop</span>"
-                    f"<span class='bt-val'>{ec.get('TrailStop',0)}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>📉 Trend (SMA×{SMA_EXIT_BUFFER})</span>"
-                    f"<span class='bt-val'>{ec.get('Trend',0)}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>⏱️ Max Süre ({MAX_HOLD_BARS} bar)</span>"
-                    f"<span class='bt-val wn'>{ec.get('MaxHold',0)}</span></div>"
-                    f"<div class='bt-row'><span class='bt-lbl'>📋 Veri Sonu</span>"
-                    f"<span class='bt-val'>{ec.get('EndOfData',0)}</span></div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-                st.caption(
-                    f"V20 Düzeltmeleri: ①Bileşik getiri ②BH adil karşılaştırma (ilk giriş anı + komisyon) "
-                    f"③MAX_HOLD {MAX_HOLD_BARS} bar ({MAX_HOLD_BARS//26:.0f} iş günü) "
-                    f"④SMA20 çıkış buffer %{(1-SMA_EXIT_BUFFER)*100:.1f} ⑤DD bileşik equity curve  \n"
-                    f"Giriş: Trend+RSI(45-75)+RS+ADX>20++DI>-DI+Breakout  \n"
-                    f"Canlı 22 filtreden {BT_CORE_FILTERS} core — istatistiksel anlam için sadeleştirildi."
-                )
+                    # ── Genel Özet ────────────────────────────────────────────
+                    pf_v   = f"{vres['pf']:.2f}" if vres["pf"] != float("inf") else "∞"
+                    st.markdown(metric_grid(
+                        ("Toplam İşlem",    str(vres["n"]),              "up" if vres["n"] >= 5 else "wn"),
+                        ("Genel Win Rate",  f"%{vres['wr']:.1f}",        "up" if vres["wr"] >= 50 else "dn"),
+                        ("Profit Factor",   pf_v,                        "up" if vres["pf"] > 1  else "dn"),
+                        ("Al-Bekle (adil)", f"%{vres['bh']:.2f}",        "up" if vres["bh"] >= 0 else "dn"),
+                        ("Toplam Getiri",   f"%{vres['total']:.2f}",     "up" if vres["total"] >= 0 else "dn"),
+                        ("Veri",           f"{vres['interval']}/{vres['period']}", ""),
+                    ), unsafe_allow_html=True)
+
+                    # ── Ana Verdict ───────────────────────────────────────────
+                    st.markdown(
+                        f"<div class='bt-info-box' style='margin-top:6px'>"
+                        f"<div class='bt-title'>📐 Skor–Performans İlişkisi</div>"
+                        f"<div class='bt-row'><span class='bt-lbl' style='font-size:13px'>"
+                        f"{vres['trend_verdict']}</span></div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    # ── Skor Grubu Tablosu ────────────────────────────────────
+                    st.markdown("<div class='sec-divider'>SKOR GRUBU ANALİZİ</div>",
+                                unsafe_allow_html=True)
+                    sg = vres["score_groups"]
+                    rows_html = ""
+                    for grp in ["0–9", "10–12", "13–15", "16–18", "19–22"]:
+                        m = sg.get(grp)
+                        if m is None:
+                            rows_html += (
+                                f"<div class='bt-row'>"
+                                f"<span class='bt-lbl'>Skor {grp}</span>"
+                                f"<span class='bt-val' style='color:#6b7280'>— veri yok —</span>"
+                                f"</div>"
+                            )
+                            continue
+                        wr_c  = "up" if m["wr"] >= 55 else ("wn" if m["wr"] >= 45 else "dn")
+                        pf_s  = f"{m['pf']:.2f}" if m["pf"] != float("inf") else "∞"
+                        pf_c  = "up" if m["pf"] > 1.2 else ("wn" if m["pf"] >= 1.0 else "dn")
+                        avg_c = "up" if m["avg_pnl"] > 0 else "dn"
+                        rows_html += (
+                            f"<div class='bt-info-box' style='margin-bottom:4px'>"
+                            f"<div class='bt-title'>Skor {grp} — {m['n']} işlem</div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Win Rate</span>"
+                            f"<span class='bt-val {wr_c}'>%{m['wr']:.1f}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Ort. Getiri</span>"
+                            f"<span class='bt-val {avg_c}'>%{m['avg_pnl']:.2f}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Medyan Getiri</span>"
+                            f"<span class='bt-val'>%{m['med_pnl']:.2f}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Profit Factor</span>"
+                            f"<span class='bt-val {pf_c}'>{pf_s}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Max Drawdown</span>"
+                            f"<span class='bt-val dn'>%{m['max_dd']:.1f}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Ort. Süre</span>"
+                            f"<span class='bt-val'>{m['avg_bars']:.0f} bar</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Ort. Maks Kâr</span>"
+                            f"<span class='bt-val up'>%{m['avg_maxp']:.2f}</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>Ort. Maks Zarar</span>"
+                            f"<span class='bt-val dn'>%{m['avg_maxl']:.2f}</span></div>"
+                            f"</div>"
+                        )
+                    st.markdown(rows_html, unsafe_allow_html=True)
+
+                    # ── Filtre Katkı Analizi ──────────────────────────────────
+                    st.markdown("<div class='sec-divider'>FİLTRE KATKI ANALİZİ</div>",
+                                unsafe_allow_html=True)
+                    fc = vres["filter_contrib"]
+                    filter_rows = ""
+                    for fn, data in fc.items():
+                        w  = data["with"]
+                        wo = data["without"]
+                        if w is None or wo is None:
+                            continue
+                        wr_diff  = w["wr"]      - wo["wr"]
+                        avg_diff = w["avg_pnl"] - wo["avg_pnl"]
+                        diff_c   = "up" if wr_diff > 3 else ("dn" if wr_diff < -3 else "wn")
+                        filter_rows += (
+                            f"<div class='bt-info-box' style='margin-bottom:3px'>"
+                            f"<div class='bt-title'>{fn}</div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>✅ Varsa  (n={w['n']})  WR=%{w['wr']:.0f}  Ort=%{w['avg_pnl']:.1f}</span>"
+                            f"<span class='bt-val {diff_c}'>Δ WR {wr_diff:+.0f}%</span></div>"
+                            f"<div class='bt-row'>"
+                            f"<span class='bt-lbl'>❌ Yoksa  (n={wo['n']}) WR=%{wo['wr']:.0f}  Ort=%{wo['avg_pnl']:.1f}</span>"
+                            f"<span class='bt-val'>Δ Avg {avg_diff:+.1f}%</span></div>"
+                            f"</div>"
+                        )
+                    st.markdown(filter_rows, unsafe_allow_html=True)
+
+                    # ── İşlem Logu ────────────────────────────────────────────
+                    if st.checkbox("📋 İşlem Logunu Göster", key="val_log"):
+                        log_df = pd.DataFrame([
+                            {
+                                "Tarih":   t["entry_date"],
+                                "Skor":    t["score"],
+                                "PnL%":    round(t["pnl"], 2),
+                                "Bar":     t["bars"],
+                                "Çıkış":   t["why"],
+                                "MaksKâr": round(t["max_profit"], 2),
+                                "MaksZar": round(t["max_loss"],   2),
+                            }
+                            for t in vres["trades"]
+                        ])
+                        st.dataframe(log_df, use_container_width=True, height=300)
+
+                    st.caption(
+                        "Not: HTF_Trend (4H) ve Sektör_RS ayrı API çağrısı gerektirdiğinden "
+                        "backtest döngüsünde hesaplanmıyor. "
+                        "HTF_Trend=False (skor içinde sayılmıyor), Sektör_RS=True (nötr) sabit değer kullanılıyor."
+                    )
     else:
         st.warning("Seçili hisse için veri alınamadı.")
