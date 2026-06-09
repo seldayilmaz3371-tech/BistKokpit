@@ -1027,7 +1027,7 @@ with st.sidebar:
     st.caption(f"📋 {len(st.session_state.watchlist)} hisse  ·  Liste yenilemede korunur.")
 
 # ── ANA EKRAN ─────────────────────────────────────────────────────────────────
-col_l, col_c, col_r = st.columns([2.5, 5, 2.5])
+col_l, col_c, col_r = st.columns([3.5, 4, 2.5])
 df = get_data(secilen)
 
 # ══ SOL: SCANNER ══════════════════════════════════════════════════════════════
