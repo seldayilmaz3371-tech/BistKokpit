@@ -1,12 +1,17 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BACKTEST PATCH — V19  (V18 üzerine 4 kritik düzeltme)                     ║
+# ║  BIST KOKPİT V21  (V20 üzerine 8 hata düzeltmesi)                          ║
 # ║                                                                             ║
-# ║  Değişen 3 şey:                                                             ║
-# ║   A. get_backtest_data()  — backtest için AYRI 1y/15m veri çekimi          ║
-# ║   B. run_backtest()       — 6 sorunun tamamı düzeltildi                    ║
-# ║   C. VolPct hesabı        — get_data() içinde vektörel, O(n) versiyonu     ║
+# ║  Düzeltilen hatalar:                                                        ║
+# ║   1. sektor_rs_ok: None → False (yanlış pozitif sinyal önlendi)            ║
+# ║   2. run_backtest stop: Close → Low bazlı, çıkış trail_stop fiyatından     ║
+# ║   3. GapPct ölü kod temizlendi (çift hesaplama)                            ║
+# ║   4. run_validation VCP intrabar lookahead düzeltildi (i+1 → i)            ║
+# ║   5. run_validation vol_pct O(n²) → _vol_pct_vectorized                    ║
+# ║   6. run_validation VCP pandas .iloc → numpy array slice                   ║
+# ║   7. run_backtest ADX eşik: sabit 20 → ADX_THRESHOLD sabiti               ║
+# ║   8. is_closed durumunda Broker sekmesinde piyasa kapalı uyarısı           ║
 # ║                                                                             ║
-# ║  Sayfa yapısı, BIST_30, CSS, diğer tüm fonksiyonlar değişmedi.            ║
+# ║  Değişmeyen: CSS, UI düzeni, VWAP, ADX matematik, drawdown, BH karş.      ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 import streamlit as st
@@ -17,7 +22,7 @@ import plotly.graph_objects as go
 import datetime
 
 st.set_page_config(
-    page_title="BIST Kokpit V19.0",
+    page_title="BIST Kokpit V21.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -323,8 +328,6 @@ def get_data(ticker):
         df["OBV_MA20"]  = df["OBV"].rolling(20).mean()
         df["OBV_High20"]= df["OBV"].rolling(OBV_BRK_LOOKBACK).max().shift(1)
 
-        df["GapPct"]    = ((df["Open"] - c.shift()).abs() / c.shift().replace(0, np.nan))
-
         df["RSI_Pct"]   = (df["RSI"]
                            .rolling(RSI_PCT_LOOKBACK, min_periods=30)
                            .apply(lambda x: (x[:-1] < x[-1]).sum() / (len(x)-1) * 100 if len(x) > 1 else 50, raw=True))
@@ -540,7 +543,7 @@ def run_backtest(ticker: str):
                 if (r.Close > r.SMA20
                         and 45 < r.RSI < 75
                         and rs_ok
-                        and r.ADX > 20
+                        and r.ADX > ADX_THRESHOLD
                         and r.PlusDI > r.MinusDI
                         and brk_ok):
                     pos        = True
@@ -561,7 +564,7 @@ def run_backtest(ticker: str):
                     trail_stop = peak_price - entry_atr * TRAIL_ATR_MULT
 
                 exit_reason = None
-                if r.Close < trail_stop:
+                if r.Low < trail_stop:
                     exit_reason = "TrailStop"
                 # DÜZELTME 6: SMA20 çıkışına buffer ekle — gürültü filtrelenir
                 # Eski: r.Close < r.SMA20  → her kapanışta tetikleniyordu
@@ -573,7 +576,10 @@ def run_backtest(ticker: str):
                     exit_reason = "MaxHold"
 
                 if exit_reason:
-                    sell_net = r.Close * (1 - TRADE_COST)
+                    # TrailStop tetiklendiyse çıkış fiyatı trail_stop (gerçekçi simülasyon)
+                    # Diğer çıkışlarda kapanış fiyatı kullanılır
+                    exit_price = trail_stop if exit_reason == "TrailStop" else r.Close
+                    sell_net = exit_price * (1 - TRADE_COST)
                     trades.append({
                         "pnl":  (sell_net - buy_cost) / buy_cost * 100,
                         "why":  exit_reason,
@@ -720,14 +726,9 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         # OBV Breakout
         obv_h20_s = bt["OBV"].rolling(OBV_BRK_LOOKBACK).max().shift(1)
 
-        # VolPct (basitleştirilmiş — tam backtest verisinde 250 bar pencere)
-        vol_arr = bt["Volume"].values
-        n_bars  = len(vol_arr)
-        vol_pct_arr = np.full(n_bars, 50.0)
-        for i in range(VOL_PCT_LOOKBACK - 1, n_bars):
-            w = vol_arr[max(0, i - VOL_PCT_LOOKBACK + 1):i + 1]
-            vol_pct_arr[i] = (w < w[-1]).sum() / (len(w) - 1) * 100 if len(w) > 1 else 50.0
-        vol_pct_s = pd.Series(vol_pct_arr, index=bt.index)
+        # VolPct — canlı sistemle tutarlı vektörel hesaplama
+        vol_pct_s = _vol_pct_vectorized(bt["Volume"], VOL_PCT_LOOKBACK)
+        n_bars    = len(bt)
 
         # ATR Slope
         atr_slope_s = bt["ATR"].diff(ATR_EXP_BARS)
@@ -748,17 +749,24 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                              if len(x) > 1 else 50.0, raw=True))
 
         # VCP: std ve volume daralması — pencere bazlı
-        vcp_s_arr = np.zeros(n_bars, dtype=bool)
+        # V21: pandas .iloc → numpy array slice (performans + VCP intrabar lookahead düzeltmesi)
+        # Eski: c.iloc[i - VCP_LOOKBACK:i + 1]  → mevcut barın kapanışı dahil (intrabar lookahead)
+        # Yeni: close_a[i - VCP_LOOKBACK:i]      → mevcut bar hariç, sadece geçmiş
+        close_a_vcp  = bt["Close"].values
+        vol_arr_vcp  = bt["Volume"].values
+        vcp_s_arr    = np.zeros(n_bars, dtype=bool)
         for i in range(VCP_LOOKBACK, n_bars):
-            c_w  = c.iloc[i - VCP_LOOKBACK:i + 1]
-            v_w  = bt["Volume"].iloc[i - VCP_LOOKBACK:i + 1]
-            std_r = c_w.iloc[-20:].std()
+            c_w   = close_a_vcp[i - VCP_LOOKBACK:i]
+            v_w   = vol_arr_vcp[i - VCP_LOOKBACK:i]
+            if len(c_w) < 21:
+                continue
+            std_r = c_w[-20:].std()
             std_l = c_w.std()
-            vol_r = v_w.iloc[-20:].mean()
+            vol_r = v_w[-20:].mean()
             vol_l = v_w.mean()
             pc = (std_r < std_l * 0.85) if std_l > 0 else False
             vc = (vol_r < vol_l * 0.75)  if vol_l  > 0 else False
-            rs_flag = float(c_w.iloc[-1]) > float(c_w.iloc[-20])
+            rs_flag = float(c_w[-1]) > float(c_w[-20])
             vcp_s_arr[i] = (int(pc) + int(vc) + int(rs_flag)) >= 2
         vcp_bool_s = pd.Series(vcp_s_arr, index=bt.index)
 
@@ -781,6 +789,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
 
         idx_arr       = bt.index
         close_a       = bt["Close"].values
+        low_a         = bt["Low"].values
         sma20_a       = bt["SMA20"].values
         atr_a         = bt["ATR"].values
         rsi_a         = bt["RSI"].values
@@ -823,6 +832,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
 
         for i in range(1, n_bars):   # i=0 skip: prev_close_a[0] wrap-around anlamsız
             cv      = close_a[i]
+            low_v   = low_a[i]
             sma20v  = sma20_a[i]
             atrv    = atr_a[i]
             rsiv    = rsi_a[i]
@@ -894,7 +904,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                 if cv < min_price_held: min_price_held = cv
 
                 exit_reason = None
-                if cv < trail_stop:
+                if low_v < trail_stop:
                     exit_reason = "TrailStop"
                 elif cv < sma20v * SMA_EXIT_BUFFER:
                     exit_reason = "Trend"
@@ -902,7 +912,8 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                     exit_reason = "MaxHold"
 
                 if exit_reason:
-                    sell_net   = cv * (1 - TRADE_COST)
+                    exit_price = trail_stop if exit_reason == "TrailStop" else cv
+                    sell_net   = exit_price * (1 - TRADE_COST)
                     pnl_val    = (sell_net - buy_cost) / buy_cost * 100
                     max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
                     max_loss   = (min_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
@@ -1599,7 +1610,7 @@ with col_r:
         vwap_ok       = (fiyat > vwap_val) if (vwap_val and not pd.isna(vwap_val)) else None
 
         rs_xu100_ok, rs_sektor_ok, sektor_sym = sektor_rs(df["Close"], secilen, xu100)
-        sektor_rs_ok = (rs_sektor_ok is True) if rs_sektor_ok is not None else True
+        sektor_rs_ok = (rs_sektor_ok is True) if rs_sektor_ok is not None else False
 
         vcp_s, vcp_pc, vcp_vc, vcp_rs_flag = vcp_score(df)
         vcp_ok = vcp_s >= 2
@@ -1649,7 +1660,7 @@ with col_r:
             st.caption("⏱️ 15dk gecikmeli veri — giriş öncesi teyit alın.")
 
         with tab2:
-            if fr["css"] in ("fb-yellow","fb-red") and not fr["is_closed"]:
+            if fr["css"] in ("fb-yellow","fb-red") or fr["is_closed"]:
                 st.markdown(freshness_html(fr,"font-size:10px;padding:3px 8px"), unsafe_allow_html=True)
             if not gap_ok:
                 st.markdown(
