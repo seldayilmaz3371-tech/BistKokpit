@@ -1,5 +1,20 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  BIST KOKPİT V23.4 — registry kaldırıldı, sade _yf_get() wrapper      ║
+# ║  BIST KOKPİT V23.5                                                          ║
+# ║                                                                             ║
+# ║  V23.5 Düzeltmeleri (V23.4 üzerine):                                        ║
+# ║                                                                             ║
+# ║  [BUG-11] Vol_Confirmed filtresi finansal hata düzeltildi                  ║
+# ║           ÖNCEKİ: vol_ratio_now = cv / volmav  →  Fiyat / HacimOrtalama   ║
+# ║           Finansal olarak anlamsız — birim uyumsuzluğu (TL / adet)         ║
+# ║           YENİSİ: vol_ratio_now = vol_a[i] / volmav  →  Hacim / HacimOrt  ║
+# ║           Canlı sistemdeki vol_ratio = vol_now / vol_ma ile artık tutarlı  ║
+# ║           Etki: Vol_Confirmed filtresi gerçek RVOL ölçüyor                 ║
+# ║                                                                             ║
+# ║  [BUG-12] Veri doğrulama katmanı eklendi (_validate_ohlcv)                 ║
+# ║           ÖNCEKİ: yfinance'ten gelen veri doğrudan kullanılıyordu          ║
+# ║           Korumasız: Close<=0, Volume<0, High<Low, satır duplikasyonu      ║
+# ║           YENİSİ: _yf_get() dönüşünde _validate_ohlcv() çağrılıyor        ║
+# ║           Hatalı barlar NaN'a dönüştürülüyor, downstream dropna temizliyor ║
 # ║                                                                             ║
 # ║  Kritik Düzeltmeler (V21 üzerine):                                          ║
 # ║                                                                             ║
@@ -61,7 +76,7 @@ import plotly.graph_objects as go
 import datetime
 
 st.set_page_config(
-    page_title="BIST Kokpit V23.4",
+    page_title="BIST Kokpit V23.5",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -233,11 +248,12 @@ SEKTOR_MAP = {
 # Uyarı suppress: "possibly delisted" / "no price data" konsolunu kirletmesin.
 
 def _yf_get(sym: str, period: str, interval: str):
-    """Ham yfinance indirme — flatten + uyarı suppress. Cache çağıranda."""
+    """Ham yfinance indirme — flatten + validate + uyarı suppress. Cache çağıranda."""
     import contextlib, io
     with contextlib.redirect_stderr(io.StringIO()),          contextlib.redirect_stdout(io.StringIO()):
-        return _flatten(yf.download(sym, period=period, interval=interval,
+        raw = _flatten(yf.download(sym, period=period, interval=interval,
                                     progress=False, auto_adjust=False))
+    return _validate_ohlcv(raw)
 
 
 # ── VERİ KATMANI ─────────────────────────────────────────────────────────────
@@ -269,6 +285,51 @@ def _flatten(df):
     if hasattr(df.index, "tz") and df.index.tz is not None:
         df.index = df.index.tz_convert(None)
     return df if not df.empty else None
+
+def _validate_ohlcv(df):
+    """
+    [BUG-12] Veri kalitesi doğrulama katmanı.
+
+    yfinance zaman zaman aşağıdaki sorunları içeren veri döndürebilir:
+      - Close <= 0  : silinmiş/hatalı sembol artık fiyatları
+      - Volume < 0  : veri sağlayıcı hatası
+      - High < Low  : OHLC tutarsızlığı
+      - High < Close veya High < Open  : bar bütünlüğü bozuk
+      - Low > Close veya Low > Open    : bar bütünlüğü bozuk
+      - Duplicate index               : aynı timestamp'te birden fazla bar
+
+    Yaklaşım:
+      Hatalı barların satırını silmek yerine Close'u NaN yapıyoruz.
+      Downstream'deki dropna(subset=["SMA20","ATR","RSI"]) veya
+      dropna(subset=["Close"]) bu barları zaten temizliyor.
+      Böylece indeks bütünlüğü korunuyor, hesaplamalar bozulmuyor.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    # Duplicate index satırlarını kaldır (ilk occurrence kalsın)
+    if df.index.duplicated().any():
+        df = df[~df.index.duplicated(keep="first")]
+
+    # Close <= 0 : anlamsız fiyat
+    mask_close = df["Close"] <= 0
+    # Volume < 0 : veri hatası
+    mask_vol   = df["Volume"] < 0
+    # High < Low : OHLC bütünlüğü bozuk
+    mask_hl    = df["High"] < df["Low"]
+    # High < Close veya High < Open
+    mask_h     = (df["High"] < df["Close"]) | (df["High"] < df["Open"])
+    # Low > Close veya Low > Open
+    mask_l     = (df["Low"] > df["Close"]) | (df["Low"] > df["Open"])
+
+    bad = mask_close | mask_vol | mask_hl | mask_h | mask_l
+    if bad.any():
+        # Hatalı barları NaN'a çevir — silme, index boşluğu yaratma
+        df.loc[bad, ["Open","High","Low","Close","Volume"]] = np.nan
+
+    return df
 
 def _calc_rsi(close, period=14):
     """Wilder RSI — TradingView ile eşleşen yöntem."""
@@ -1023,6 +1084,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         close_a      = bt["Close"].values
         low_a        = bt["Low"].values
         open_a       = bt["Open"].values
+        vol_a        = bt["Volume"].values    # [BUG-11] Vol_Confirmed için hacim array
         sma20_a      = bt["SMA20"].values
         atr_a        = bt["ATR"].values
         rsi_a        = bt["RSI"].values
@@ -1086,7 +1148,10 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
             if np.isnan(cv) or np.isnan(sma20v) or np.isnan(atrv):
                 continue
 
-            vol_ratio_now = (cv / volmav) if (not np.isnan(volmav) and volmav > 0) else 1.0
+            # [BUG-11] Vol_Confirmed: Hacim / HacimOrtalama (RVOL)
+            # ÖNCEKİ: cv / volmav → Fiyat / HacimOrtalama → finansal anlamsız
+            # YENİSİ: vol_a[i] / volmav → gerçek RVOL, canlı sistemle tutarlı
+            vol_ratio_now = (vol_a[i] / volmav) if (not np.isnan(volmav) and volmav > 0) else 1.0
             di_spread_now = pdi_v - mdi_v
 
             # [BUG-08] Weighted score: DI_Spread 0.5 ağırlık (ADX triple-count önleme)
