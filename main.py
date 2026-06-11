@@ -802,13 +802,132 @@ def run_backtest(ticker: str):
 # ║  + [BUG-09] HTF_Trend cached değeri                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  V23 run_validation_backtest                                                 ║
+# ║                                                                             ║
+# ║  [BUG-11] HTF_Trend temporal contamination DÜZELTİLDİ                      ║
+# ║           ÖNCEKİ: htf_trend(ticker) → runtime scalar bool →                 ║
+# ║           tüm ~1400 geçmiş 15m bara aynı değer enjekte ediliyordu           ║
+# ║           (static future state injection / temporal contamination)           ║
+# ║           YENİSİ: _build_htf_series_for_backtest() →                        ║
+# ║           her 15m bar yalnızca o anda bilinebilecek son tamamlanmış         ║
+# ║           4H candle'ın SMA50>SMA200 durumunu görür                          ║
+# ║           Yöntem: shift(1) + merge_asof(direction="backward")               ║
+# ║           shift(1): 14:00 kapanışı → 18:00'den itibaren görünür             ║
+# ║           merge_asof backward: her 15m için geçmişteki son 4H kaydı         ║
+# ║           Warmup / veri yok → False (conservative default)                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+def _build_htf_series_for_backtest(
+    ticker: str,
+    ltf_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """
+    Her 15m (LTF) bar için, o anda gerçekten bilinebilecek son tamamlanmış
+    4H candle'ın SMA50 > SMA200 trend durumunu np.ndarray[bool] olarak döndürür.
+
+    Lookahead koruması iki katmanlı:
+
+    Katman 1 — shift(1):
+        get_4h() her 4H bar kapandığında SMA değerini hesaplar.
+        shift(1) bu değeri bir 4H bar öteleyerek "bu bilgi ancak bir sonraki
+        4H bar açıldıktan sonra kullanılabilir" garantisini verir.
+        14:00 kapanışının SMA50>SMA200 sonucu → 18:00 barından itibaren görünür.
+        Tamamlanmamış candle problemi bu katmanda tamamen engellenir.
+
+    Katman 2 — merge_asof(direction="backward"):
+        Her 15m timestamp için zaman ekseninde kendisinden önce ya da
+        kendisiyle eş zamanlı olan en son 4H kaydını alır.
+        İleri yönde hiçbir eşleşme olmaz — future visibility sıfırdır.
+
+    Warmup / veri eksikliği → False (conservative):
+        SMA200 warmup (~200 bar) sırasında veya 4H verisi yoksa
+        giriş sinyali üretilmez. Backtest iyimser yönde çarpmaz.
+
+    Dönüş: np.ndarray[bool], shape=(len(ltf_index),)
+    Döngü içinde htf_a[i] ile O(1) scalar bool erişimi.
+    """
+    try:
+        df4h = get_4h(ticker)
+    except Exception:
+        return np.zeros(len(ltf_index), dtype=bool)
+
+    if df4h is None or len(df4h) < 5:
+        return np.zeros(len(ltf_index), dtype=bool)
+
+    if "SMA50" not in df4h.columns or "SMA200" not in df4h.columns:
+        return np.zeros(len(ltf_index), dtype=bool)
+
+    try:
+        # ── 4H trend boolean serisi ──────────────────────────────────────────
+        htf_raw = (df4h["SMA50"] > df4h["SMA200"]).astype(bool)
+
+        # ── shift(1): completed candle garantisi ─────────────────────────────
+        # Bir 4H bar kapandığında SMA netleşir; ancak bir sonraki 4H bar
+        # açılışından itibaren bu bilgiyi kullanabiliriz.
+        # shift(1) sonrası index[0] NaN → merge_asof eşleşemez → False (safe).
+        htf_shifted = htf_raw.shift(1)
+
+        # ── Timezone normalize — yfinance tutarsızlığı ───────────────────────
+        htf_idx = htf_shifted.index
+        if hasattr(htf_idx, "tz") and htf_idx.tz is not None:
+            htf_idx = htf_idx.tz_convert(None)
+            htf_shifted = htf_shifted.copy()
+            htf_shifted.index = htf_idx
+
+        ltf_idx = ltf_index
+        if hasattr(ltf_idx, "tz") and ltf_idx.tz is not None:
+            ltf_idx = ltf_idx.tz_convert(None)
+
+        # ── merge_asof hazırlık ───────────────────────────────────────────────
+        htf_df = pd.DataFrame({
+            "_ts":       htf_idx,
+            "HTF_Trend": htf_shifted.values,
+        }).sort_values("_ts").reset_index(drop=True)
+
+        ltf_df = pd.DataFrame({
+            "_ts": ltf_idx,
+        }).sort_values("_ts").reset_index(drop=True)
+
+        # ── merge_asof: backward — future visibility sıfır ───────────────────
+        # Her 15m bar için: zaman ekseninde kendisinden önce kapanmış
+        # en son 4H bar'ın trend durumu. İlerideki hiçbir 4H bar görünmez.
+        merged = pd.merge_asof(
+            ltf_df,
+            htf_df,
+            on="_ts",
+            direction="backward",
+            tolerance=pd.Timedelta("8h"),  # 2 × 4H pencere — outlier koruması
+        )
+
+        # ── Sonucu orijinal ltf_index sırasına hizala ─────────────────────────
+        result_series = pd.Series(
+            merged["HTF_Trend"].values,
+            index=ltf_idx,
+            dtype=object,
+        )
+        result_aligned = result_series.reindex(ltf_index, fill_value=False)
+
+        # ── NaN → False, bool array ───────────────────────────────────────────
+        return result_aligned.fillna(False).astype(bool).values
+
+    except Exception:
+        return np.zeros(len(ltf_index), dtype=bool)
+
+
 def run_validation_backtest(ticker: str, min_score: int = 1):
     """
-    22 filtreli Validation Backtest — V22 düzeltmeleri.
+    22 filtreli Validation Backtest — V23 düzeltmeleri.
 
     [BUG-04] TrailStop: çıkış kontrolü peak güncellemesinden önce
     [BUG-08] DI_Spread'e 0.5 ağırlık (ADX triple-count önleme)
-    [BUG-09] HTF_Trend: sabit False yerine cached 4H trend
+    [BUG-09] HTF_Trend: sabit False yerine cached 4H trend            (V22)
+    [BUG-11] HTF_Trend: static scalar → time-aligned series           (V23)
+             _build_htf_series_for_backtest() kullanılıyor:
+             shift(1) + merge_asof(backward) ile temporal contamination
+             tamamen ortadan kaldırıldı.
     """
     bt_df  = get_backtest_data(ticker)
 
@@ -823,7 +942,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         return {"err": f"Yeterli veri yok ({len(bt_df)} bar < 100)"}
 
     try:
-        # RS serisi
+        # ── RS serisi ─────────────────────────────────────────────────────────
         if xu_df is not None and len(xu_df) > 20:
             aligned   = bt_df[["Close"]].join(xu_df["Close"].rename("XU100"), how="inner")
             rs_raw    = aligned["Close"] / aligned["XU100"]
@@ -831,19 +950,27 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
             rs_above  = (rs_raw > rs_ma20).reindex(bt_df.index, fill_value=False)
             rs_slope  = (rs_raw.diff(RS_SLOPE_BARS) > 0).reindex(bt_df.index, fill_value=False)
         else:
-            rs_above = pd.Series(False, index=bt_df.index)  # [BUG-10] conservative
+            rs_above = pd.Series(False, index=bt_df.index)
             rs_slope = pd.Series(False, index=bt_df.index)
 
         bt = bt_df.copy()
         c  = bt["Close"]
 
-        # [BUG-09] HTF_Trend: cached 4H veri (validation loop içinde her bar için değil,
-        # mevcut durumu temsil eden tek değer — daha gerçekçi backtest için
-        # ideal olurdu bar-by-bar 4H veri ama yfinance kısıtı nedeniyle tek değer kullanılıyor)
-        htf_val = htf_trend(ticker)
-        htf_bool_val = (htf_val is True)  # None → False (conservative)
+        # ── [BUG-11] HTF_Trend: time-aligned series ───────────────────────────
+        # ESKİ (temporal contamination — V22):
+        #   htf_val      = htf_trend(ticker)   # runtime'daki tek scalar bool
+        #   htf_bool_val = (htf_val is True)   # ~1400 geçmiş bara sabit enjekte
+        #
+        # YENİ (lookahead-safe — V23):
+        #   Her 15m bara yalnızca o anda bilinebilecek son tamamlanmış
+        #   4H candle'ın SMA50>SMA200 durumu yazılır.
+        #   shift(1): completed candle garantisi
+        #   merge_asof(backward): future visibility = 0
+        htf_a = _build_htf_series_for_backtest(ticker, bt.index)
+        # htf_a: np.ndarray[bool], len = len(bt)
+        # Döngü içinde htf_a[i] ile O(1) erişim.
 
-        # Bollinger Squeeze
+        # ── Bollinger Squeeze ─────────────────────────────────────────────────
         sma20_bt  = c.rolling(20).mean()
         bb_w      = (4 * c.rolling(20).std()) / sma20_bt.replace(0, np.nan)
         sqz_thr   = bb_w.rolling(SQUEEZE_LOOKBACK, min_periods=30).quantile(0.15)
@@ -857,11 +984,10 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         atr_slope_s = bt["ATR"].diff(ATR_EXP_BARS)
         adx_slope_s = bt["ADX"].diff(ADX_SLOPE_BARS)
 
-        rsi_pct_s = _rolling_rank_pct(bt["RSI"], RSI_PCT_LOOKBACK, min_periods=30)
-
+        rsi_pct_s  = _rolling_rank_pct(bt["RSI"], RSI_PCT_LOOKBACK, min_periods=30)
         atr_pct2_s = _rolling_rank_pct(bt["ATR"], ATR_PCT_LOOKBACK, min_periods=30)
 
-        # VCP
+        # ── VCP ───────────────────────────────────────────────────────────────
         close_a_vcp  = bt["Close"].values
         vol_arr_vcp  = bt["Volume"].values
         vcp_s_arr    = np.zeros(n_bars, dtype=bool)
@@ -874,13 +1000,13 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
             std_l = c_w.std()
             vol_r = v_w[-20:].mean()
             vol_l = v_w.mean()
-            pc = (std_r < std_l * 0.85) if std_l > 0 else False
-            vc = (vol_r < vol_l * 0.75)  if vol_l  > 0 else False
+            pc    = (std_r < std_l * 0.85) if std_l > 0 else False
+            vc    = (vol_r < vol_l * 0.75)  if vol_l > 0 else False
             rs_flag = float(c_w[-1]) > float(c_w[-20])
             vcp_s_arr[i] = (int(pc) + int(vc) + int(rs_flag)) >= 2
         vcp_bool_s = pd.Series(vcp_s_arr, index=bt.index)
 
-        # VWAP
+        # ── VWAP ──────────────────────────────────────────────────────────────
         try:
             typical   = (bt["High"] + bt["Low"] + bt["Close"]) / 3
             pv        = typical * bt["Volume"]
@@ -892,36 +1018,38 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         except Exception:
             vwap_bool = pd.Series(False, index=bt.index)
 
-        # NumPy array erişimi
-        idx_arr       = bt.index
-        close_a       = bt["Close"].values
-        low_a         = bt["Low"].values
-        open_a        = bt["Open"].values   # G3: gap-aware slippage
-        sma20_a       = bt["SMA20"].values
-        atr_a         = bt["ATR"].values
-        rsi_a         = bt["RSI"].values
-        adx_a         = bt["ADX"].values
-        plus_di_a     = bt["PlusDI"].values
-        minus_di_a    = bt["MinusDI"].values
-        vol_ma_a      = bt["VolMA20"].values
-        high20_a      = bt["High20"].values
-        obv_a         = bt["OBV"].values
-        obv_ma_a      = bt["OBV_MA20"].values
-        prev_close_a  = np.roll(close_a, 1)
+        # ── NumPy array bloğu ─────────────────────────────────────────────────
+        idx_arr      = bt.index
+        close_a      = bt["Close"].values
+        low_a        = bt["Low"].values
+        open_a       = bt["Open"].values
+        sma20_a      = bt["SMA20"].values
+        atr_a        = bt["ATR"].values
+        rsi_a        = bt["RSI"].values
+        adx_a        = bt["ADX"].values
+        plus_di_a    = bt["PlusDI"].values
+        minus_di_a   = bt["MinusDI"].values
+        vol_ma_a     = bt["VolMA20"].values
+        high20_a     = bt["High20"].values
+        obv_a        = bt["OBV"].values
+        obv_ma_a     = bt["OBV_MA20"].values
+        prev_close_a = np.roll(close_a, 1)
 
-        rs_above_a    = rs_above.reindex(bt.index, fill_value=False).values
-        rs_slope_a    = rs_slope.reindex(bt.index,  fill_value=False).values
-        sqz_a         = sqz_s.reindex(bt.index,     fill_value=False).values
-        atr_pct_a     = atr_pct_s.reindex(bt.index, fill_value=np.nan).values
-        vol_pct_a     = vol_pct_s.reindex(bt.index, fill_value=50.0).values
-        atr_slope_a   = atr_slope_s.reindex(bt.index, fill_value=np.nan).values
-        adx_slope_a   = adx_slope_s.reindex(bt.index, fill_value=np.nan).values
-        rsi_pct_a     = rsi_pct_s.reindex(bt.index,   fill_value=np.nan).values
-        atr_pct2_a    = atr_pct2_s.reindex(bt.index,  fill_value=np.nan).values
-        vcp_a         = vcp_bool_s.reindex(bt.index,  fill_value=False).values
-        obv_h20_a     = obv_h20_s.reindex(bt.index,   fill_value=np.nan).values
-        vwap_a        = vwap_bool.reindex(bt.index,    fill_value=False).values
+        rs_above_a  = rs_above.reindex(bt.index, fill_value=False).values
+        rs_slope_a  = rs_slope.reindex(bt.index,  fill_value=False).values
+        sqz_a       = sqz_s.reindex(bt.index,     fill_value=False).values
+        atr_pct_a   = atr_pct_s.reindex(bt.index, fill_value=np.nan).values
+        vol_pct_a   = vol_pct_s.reindex(bt.index, fill_value=50.0).values
+        atr_slope_a = atr_slope_s.reindex(bt.index, fill_value=np.nan).values
+        adx_slope_a = adx_slope_s.reindex(bt.index, fill_value=np.nan).values
+        rsi_pct_a   = rsi_pct_s.reindex(bt.index,   fill_value=np.nan).values
+        atr_pct2_a  = atr_pct2_s.reindex(bt.index,  fill_value=np.nan).values
+        vcp_a       = vcp_bool_s.reindex(bt.index,  fill_value=False).values
+        obv_h20_a   = obv_h20_s.reindex(bt.index,   fill_value=np.nan).values
+        vwap_a      = vwap_bool.reindex(bt.index,    fill_value=False).values
+        # htf_a: zaten np.ndarray[bool] — reindex gerekmez.
 
+        # ── Backtest değişkenleri ─────────────────────────────────────────────
         pos               = False
         buy_cost          = 0.0
         trail_stop        = 0.0
@@ -937,10 +1065,11 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         first_entry_price = None
         bh_buy_cost       = None
 
+        # ── Ana döngü ─────────────────────────────────────────────────────────
         for i in range(1, n_bars):
             cv      = close_a[i]
             low_v   = low_a[i]
-            open_v  = open_a[i]   # G3: gap-aware slippage
+            open_v  = open_a[i]
             sma20v  = sma20_a[i]
             atrv    = atr_a[i]
             rsiv    = rsi_a[i]
@@ -961,8 +1090,6 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
             di_spread_now = pdi_v - mdi_v
 
             # [BUG-08] Weighted score: DI_Spread 0.5 ağırlık (ADX triple-count önleme)
-            # ADX_Guc + ADX_Yon + DI_Spread_Half = ADX toplam katkısı max 2.5 puan
-            # (önceki 3 tam puan yerine — adil ağırlık dağılımı)
             f = {
                 "Trend(SMA20)":  bool(cv > sma20v),
                 "RSI_Band":      bool(45 < rsiv < 75),
@@ -970,18 +1097,20 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                 "RS_Slope":      bool(rs_slope_a[i]),
                 "BollingerSqz":  bool(sqz_a[i]),
                 "Vol_Confirmed": bool(vol_ratio_now >= RVOL_THRESHOLD and cv > prev_cv),
-                "HTF_Trend":     htf_bool_val,  # [BUG-09] cached değer
+                # [BUG-11] htf_bool_val (static scalar) → htf_a[i] (time-aligned)
+                # Her 15m bar kendi zamanındaki gerçek tamamlanmış 4H trend durumunu görür.
+                "HTF_Trend":     bool(htf_a[i]),
                 "Breakout":      bool(cv > h20v) if not np.isnan(h20v) else False,
                 "ATR_Zone":      bool(ATR_PCT_MIN < atr_pct_a[i] < ATR_PCT_MAX)
                                  if not np.isnan(atr_pct_a[i]) else False,
                 "ADX_Guc":       bool(adxv > ADX_THRESHOLD),
                 "ADX_Yon":       bool(pdi_v > mdi_v),
-                "Vol_Pct":       bool(vol_pct_a[i] > 55),  # [BUG-02] eşik düzeltmesi
+                "Vol_Pct":       bool(vol_pct_a[i] > 55),
                 "ATR_Expansion": bool(atr_slope_a[i] > 0) if not np.isnan(atr_slope_a[i]) else False,
                 "OBV_Akis":      bool(obvv > obv_mav) if not np.isnan(obv_mav) else False,
                 "RSI_Pct":       bool(rsi_pct_a[i] > 60) if not np.isnan(rsi_pct_a[i]) else False,
                 "ADX_Slope":     bool(adx_slope_a[i] > 0) if not np.isnan(adx_slope_a[i]) else False,
-                "Sektor_RS":     True,  # backtest'te sektör verisi yok — nötr
+                "Sektor_RS":     True,
                 "ATR_Pct":       bool(10 < atr_pct2_a[i] < 75) if not np.isnan(atr_pct2_a[i]) else False,
                 "VCP":           bool(vcp_a[i]),
                 "DI_Spread":     bool(di_spread_now > DI_SPREAD_MIN),
@@ -989,13 +1118,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                 "VWAP":          bool(vwap_a[i]),
             }
 
-            # [BUG-08] Weighted sum: DI_Spread 0.5 ağırlık
-            # Bu, skor karşılaştırmasını bozmamak için ayrı bir "weighted_score" tutuyoruz
-            # Giriş kararı hâlâ sum(f.values()) ile — min_score parametresi korunuyor
-            score_now = sum(f.values())
-            # DI_Spread ek katkısını yarıya indir (skor gösterimi için)
-            # NOT: giriş kararı için integer score kullanılmaya devam ediyor
-            # Gerçek ağırlıklı skor sadece reporting'de kullanılıyor
+            score_now      = sum(f.values())
             weighted_score = score_now - (0.5 * float(f["DI_Spread"]))
 
             if not pos:
@@ -1028,17 +1151,12 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                 elif hold_bars >= MAX_HOLD_BARS:
                     exit_reason = "MaxHold"
 
-                # Sonra peak güncelle
                 if cv > peak_price:
                     peak_price = cv
                     trail_stop = peak_price - entry_atr * TRAIL_ATR_MULT
 
                 if exit_reason:
-                    # G3: Gap-aware execution — min(trail_stop, open) gerçekçi fill.
-                    if exit_reason == "TrailStop":
-                        exit_price = min(trail_stop, open_v)
-                    else:
-                        exit_price = cv
+                    exit_price = min(trail_stop, open_v) if exit_reason == "TrailStop" else cv
                     sell_net   = exit_price * (1 - TRADE_COST)
                     pnl_val    = (sell_net - buy_cost) / buy_cost * 100
                     max_profit = (max_price_held * (1 - TRADE_COST) - buy_cost) / buy_cost * 100
@@ -1055,6 +1173,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                     })
                     pos = False
 
+        # ── Açık pozisyon kapanışı ────────────────────────────────────────────
         if pos and n_bars > 0:
             last_close = float(close_a[-1])
             sell_net   = last_close * (1 - TRADE_COST)
@@ -1075,6 +1194,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
         if not trades:
             return {"err": f"Hiç işlem sinyali oluşmadı (min_score={min_score}, {len(bt)} bar)."}
 
+        # ── Score group analizi ───────────────────────────────────────────────
         SCORE_BINS = [
             ("0–9",   0,  9),
             ("10–12", 10, 12),
@@ -1095,18 +1215,18 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
             for p in pnls:
                 eq *= (1 + p / 100)
                 eq_c.append(eq)
-            eq_s   = pd.Series(eq_c)
-            dd     = (eq_s / eq_s.cummax() - 1).min() * 100
+            eq_s = pd.Series(eq_c)
+            dd   = (eq_s / eq_s.cummax() - 1).min() * 100
             return {
-                "n":          len(trade_list),
-                "wr":         len(wins) / len(trade_list) * 100,
-                "avg_pnl":    float(np.mean(pnls)),
-                "med_pnl":    float(np.median(pnls)),
-                "pf":         pf,
-                "max_dd":     dd,
-                "avg_bars":   float(np.mean([t["bars"] for t in trade_list])),
-                "avg_maxp":   float(np.mean([t["max_profit"] for t in trade_list])),
-                "avg_maxl":   float(np.mean([t["max_loss"]   for t in trade_list])),
+                "n":        len(trade_list),
+                "wr":       len(wins) / len(trade_list) * 100,
+                "avg_pnl":  float(np.mean(pnls)),
+                "med_pnl":  float(np.median(pnls)),
+                "pf":       pf,
+                "max_dd":   dd,
+                "avg_bars": float(np.mean([t["bars"] for t in trade_list])),
+                "avg_maxp": float(np.mean([t["max_profit"] for t in trade_list])),
+                "avg_maxl": float(np.mean([t["max_loss"]   for t in trade_list])),
             }
 
         score_groups = {}
@@ -1124,12 +1244,15 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
                 "without": _group_metrics(without_f),
             }
 
-        valid_groups = [(lbl, score_groups[lbl]) for lbl in ["0–9","10–12","13–15","16–18","19–22"]
-                        if score_groups[lbl] is not None and score_groups[lbl]["n"] >= 3]
+        valid_groups = [
+            (lbl, score_groups[lbl])
+            for lbl in ["0–9", "10–12", "13–15", "16–18", "19–22"]
+            if score_groups[lbl] is not None and score_groups[lbl]["n"] >= 3
+        ]
         if len(valid_groups) >= 2:
-            wrs     = [g[1]["wr"]      for g in valid_groups]
-            avgs    = [g[1]["avg_pnl"] for g in valid_groups]
-            wr_mono  = all(wrs[i] <= wrs[i+1] for i in range(len(wrs)-1))
+            wrs      = [g[1]["wr"]      for g in valid_groups]
+            avgs     = [g[1]["avg_pnl"] for g in valid_groups]
+            wr_mono  = all(wrs[i]  <= wrs[i+1]  for i in range(len(wrs)-1))
             avg_mono = all(avgs[i] <= avgs[i+1] for i in range(len(avgs)-1))
             if wr_mono and avg_mono:
                 trend_verdict = "✅ ARTIYOR — Skor yükseldikçe hem win rate hem getiri artıyor"
@@ -1172,6 +1295,7 @@ def run_validation_backtest(ticker: str, min_score: int = 1):
 
     except Exception as e:
         return {"err": f"Validation hesaplama hatası: {str(e)}"}
+
 
 
 # ── Diğer fonksiyonlar ────────────────────────────────────────────────────────
@@ -2155,9 +2279,11 @@ with col_r:
                         st.dataframe(log_df, use_container_width=True, height=300)
 
                     st.caption(
-                        "V22: HTF_Trend artık cached 4H veri kullanıyor (sabit False yerine). "
-                        "DI_Spread 0.5 ağırlık uygulandı (ADX triple-count önleme). "
-                        "Vol_Pct eşiği >55 (min-max bias düzeltmesi)."
+                        "V23 [BUG-11]: HTF_Trend temporal contamination düzeltildi. "
+                        "Static scalar → time-aligned series. "
+                        "shift(1) + merge_asof(backward) ile her 15m bar yalnızca o anda "
+                        "bilinebilecek son tamamlanmış 4H candle trend durumunu görür. "
+                        "DI_Spread 0.5 ağırlık (ADX triple-count). Vol_Pct eşiği >55."
                     )
     else:
         st.warning("Seçili hisse için veri alınamadı.")
